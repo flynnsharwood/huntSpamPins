@@ -289,10 +289,15 @@ class DB:
         except sqlite3.OperationalError:
             pass
         self.c.executescript(SCHEMA)
-        for table, col in (("pins", "archived_at"), ("pins", "archive_dir"), ("users", "archived_at")):
+        for table, col, typ in (("pins", "archived_at", "TEXT"), ("pins", "archive_dir", "TEXT"),
+                                ("users", "archived_at", "TEXT"),
+                                # expand results: when, related items returned (NULL = request failed),
+                                # new bait pins added (0 = expanded but found nothing new)
+                                ("pins", "expanded_at", "TEXT"), ("pins", "expand_seen", "INTEGER"),
+                                ("pins", "expand_new", "INTEGER")):
             cols = {r[1] for r in self.c.execute(f"PRAGMA table_info({table})")}
             if col not in cols:
-                self.c.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
+                self.c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
         self.c.commit()
 
     def q(self, sql, *a):
@@ -436,10 +441,21 @@ def step_profiles(db, api, force=False):
         db.commit()
 
 
-def step_search(db, api, queries, max_pages):
-    queries = list(queries)
-    random.shuffle(queries)   # vary order each run so early queries don't always get the fresh rate-limit budget
-    log(f"[search] {len(queries)} queries (shuffled) x up to {max_pages} pages")
+def pick(items, n):
+    """Random order; if n > 0, only a random n of the items (the rest wait for a later run)."""
+    items = list(items)
+    random.shuffle(items)
+    return items[:n] if n and n > 0 else items
+
+
+def _picked(n_total, chosen):
+    return f"{len(chosen)} random of {n_total}" if len(chosen) < n_total else f"{n_total}"
+
+
+def step_search(db, api, queries, max_pages, sample=0):
+    all_q = list(queries)
+    queries = pick(all_q, sample)   # random subset/order so early queries don't always get the fresh rate-limit budget
+    log(f"[search] {_picked(len(all_q), queries)} queries x up to {max_pages} pages")
     for q in queries:
         page, total_new = 0, 0
         try:
@@ -464,13 +480,15 @@ def step_search(db, api, queries, max_pages):
         log(f"  {q!r}: {page} pages, {total_new} new candidate pins")
 
 
-def step_expand(db, api, max_related, max_pages):
+def step_expand(db, api, max_related, max_pages, sample=0):
     # 1. related pins of bait pins that have a link
-    rows = db.q("""SELECT pin_id FROM pins WHERE status='ok' AND bait=1 AND link<>'' AND expanded=0
-                   ORDER BY first_seen LIMIT ?""", max_related)
-    log(f"[expand] related pins for {len(rows)} bait pins")
+    all_rows = db.q("""SELECT pin_id FROM pins WHERE status='ok' AND bait=1 AND link<>'' AND expanded=0
+                       ORDER BY first_seen""")
+    caps = [n for n in (sample, max_related) if n and n > 0]
+    rows = pick(all_rows, min(caps) if caps else 0)
+    log(f"[expand] related pins for {_picked(len(all_rows), rows)} bait pins")
     for r in rows:
-        pid, new = r["pin_id"], 0
+        pid, new, seen = r["pin_id"], 0, None
         for res, opts in [
             ("RelatedModulesResource", {"pin_id": pid, "context_pin_ids": [], "search_query": "",
                                         "source": "deep_linking", "top_level_source": "deep_linking",
@@ -479,17 +497,21 @@ def step_expand(db, api, max_related, max_pages):
         ]:
             try:
                 items = list(api.paged(res, opts, f"/pin/{pid}/", max_pages=2))
+                seen = len(items)
                 if items:
                     new = ingest_items(db, items, f"related:{pid}", pid, "related"); break
             except Exception:
                 continue
-        db.x("UPDATE pins SET expanded=1 WHERE pin_id=?", pid); db.commit()
-        log(f"  {pid}: {new} new")
+        db.x("UPDATE pins SET expanded=1, expanded_at=?, expand_seen=?, expand_new=? WHERE pin_id=?",
+             now(), seen, new, pid); db.commit()
+        log(f"  {pid}: {new} new" + (" (related pins request failed)" if seen is None else
+                                     f" of {seen} related" if seen else " (no related pins)"))
 
     # 2. boards + created pins of every poster of a bait pin
-    users = db.q("""SELECT DISTINCT u.username FROM users u JOIN pins p ON p.pinner=u.username
-                    WHERE p.bait=1 AND u.crawled=0 AND u.status<>'removed'""")
-    log(f"[expand] crawling {len(users)} poster accounts")
+    all_users = db.q("""SELECT DISTINCT u.username FROM users u JOIN pins p ON p.pinner=u.username
+                        WHERE p.bait=1 AND u.crawled=0 AND u.status<>'removed'""")
+    users = pick(all_users, sample)
+    log(f"[expand] crawling {_picked(len(all_users), users)} poster accounts")
     for r in users:
         u, new = r["username"], 0
         try:
@@ -523,8 +545,9 @@ def step_expand(db, api, max_related, max_pages):
         log(f"  {u}: {new} new")
 
     # 3. boards added by hand (e.g. thibaultlabs/watch-now-10m+monthly-views)
-    boards = db.q("SELECT * FROM boards WHERE crawled=0 AND owner IS NOT NULL AND url IS NOT NULL")
-    log(f"[expand] crawling {len(boards)} queued boards")
+    all_boards = db.q("SELECT * FROM boards WHERE crawled=0 AND owner IS NOT NULL AND url IS NOT NULL")
+    boards = pick(all_boards, sample)
+    log(f"[expand] crawling {_picked(len(all_boards), boards)} queued boards")
     for b in boards:
         new, bid = 0, b["board_id"]
         try:
@@ -545,6 +568,84 @@ def step_expand(db, api, max_related, max_pages):
             log(f"  {b['url']}: error {e}")
         db.x("UPDATE boards SET crawled=1 WHERE board_key=?", b["board_key"]); db.commit()
         log(f"  {b['url']}: {new} new")
+
+
+# ----------------------------------------------------------------- search queries file
+QUERIES_HEADER = ("# pinhunt search queries - one per line. Lines starting with # are ignored.\n"
+                  "# Edit freely: delete noisy queries, add your own. `queries --update` appends new\n"
+                  "# phrases learned from bait pins in the database.\n")
+
+
+def _qnorm(q):
+    return re.sub(r"\s+", " ", q).strip().casefold()
+
+
+def load_queries(path):
+    if not os.path.exists(path):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(QUERIES_HEADER + "\n" + "\n".join(DEFAULT_QUERIES) + "\n")
+        log(f"[queries] created {path} with {len(DEFAULT_QUERIES)} default queries")
+    out = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if s and not s.startswith("#"):
+                out.append(s)
+    seen, uniq = set(), []
+    for q in out:
+        if _qnorm(q) not in seen:
+            seen.add(_qnorm(q)); uniq.append(q)
+    return uniq
+
+
+def derive_queries(db):
+    """Candidate search phrases from bait pins: Counter(query -> number of supporting pins)."""
+    rows = db.q("SELECT title, board_name, description FROM pins WHERE status='ok' AND bait=1")
+    title_counts = collections.Counter((r["title"] or "").strip() for r in rows)
+    cnt = collections.Counter()
+    for r in rows:
+        cands = set()
+        t = (r["title"] or "").strip()
+        # a title is used if it looks like bait, or is a repeated template (>=2 bait pins share it)
+        if (t and not t.lower().startswith("pin on ") and 4 <= len(t) <= 100
+                and (BAIT_RE.search(t) or title_counts[t] >= 2)):
+            cands.add(t)
+            if "▶️" in t:
+                cands.add(t.replace("▶️", "▶"))
+            elif "▶" in t:
+                cands.add(t.replace("▶", "▶️"))
+            core = re.sub(r"\s+", " ", re.sub(r"[^\w\s+'’-]", " ", t)).strip()
+            if len(core.split()) >= 2 and _qnorm(core) != _qnorm(t):
+                cands.add(core)
+        b = (r["board_name"] or "").strip()
+        if b and BAIT_RE.search(b) and len(b) <= 80:
+            cands.add(b)
+        for piece in re.split(r"[.!?\n]+", r["description"] or ""):
+            piece = piece.strip(" -–—")
+            if BAIT_RE.search(piece) and 3 <= len(piece.split()) <= 12:
+                cands.add(piece)
+        for c in cands:
+            cnt[c] += 1
+    return cnt
+
+
+def update_queries(db, path, dry_run=False, min_count=1):
+    existing = {_qnorm(q) for q in load_queries(path)}
+    new = [(q, n) for q, n in derive_queries(db).most_common()
+           if n >= min_count and _qnorm(q) not in existing]
+    if not new:
+        log(f"[queries] no new phrases to add to {path}")
+        return []
+    for q, n in new:
+        log(f"  + {q!r}  ({n} bait pin{'s' if n != 1 else ''})")
+    if dry_run:
+        log(f"[queries] dry run: {len(new)} phrases would be added to {path}")
+    else:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"\n# auto-added {now()} from bait pins in the database\n")
+            f.write("\n".join(q for q, _ in new) + "\n")
+        log(f"[queries] added {len(new)} phrases to {path}")
+    return [q for q, _ in new]
 
 
 # ----------------------------------------------------------------- archive
@@ -892,6 +993,16 @@ def report(db, out_md="report.md", out_csv="pins.csv", since=None):
             P(f"- {r['pin_id']} — {r['pinner']} — board `{r['board_name']}` — title `{r['title'][:50]}` "
               f"— repin={r['is_repin']}")
 
+    qs = db.q("""SELECT query, COUNT(DISTINCT substr(run_at,1,16)) runs, SUM(results) results,
+                 SUM(bait_hits) new_pins, MAX(run_at) last FROM searches GROUP BY query
+                 ORDER BY new_pins DESC""")
+    if qs:
+        P("\n## Search query performance\n\nQueries with 0 new pins over several runs are candidates "
+          "for deleting from the queries file.\n\n| query | runs | results seen | new pins added | last run |"
+          "\n|---|---:|---:|---:|---|")
+        for q in qs:
+            P(f"| `{q['query']}` | {q['runs']} | {q['results']} | {q['new_pins']} | {(q['last'] or '')[:16]} |")
+
     removed = [r for r in rows if r["status"] == "removed"]
     if removed:
         P(f"\n## Removed / not found ({len(removed)})\n")
@@ -918,10 +1029,18 @@ def main():
     r = sp.add_parser("resolve"); r.add_argument("--force", action="store_true")
     pr = sp.add_parser("profiles"); pr.add_argument("--force", action="store_true")
     s = sp.add_parser("search"); s.add_argument("--query", action="append", default=[])
-    s.add_argument("--only", action="store_true", help="use only --query, not the defaults")
+    s.add_argument("--queries", default="queries.txt", help="queries file (default: queries.txt)")
+    s.add_argument("--only", action="store_true", help="use only --query, not the queries file")
+    qp = sp.add_parser("queries", help="list the queries file, or --update it from bait pins in the db")
+    qp.add_argument("--queries", default="queries.txt")
+    qp.add_argument("--update", action="store_true", help="append phrases learned from bait pins")
+    qp.add_argument("--dry-run", action="store_true", help="with --update: only show what would be added")
+    qp.add_argument("--min-count", type=int, default=1, help="only phrases seen on at least N bait pins")
     s.add_argument("--max-pages", type=int, default=6)
+    s.add_argument("--sample", type=int, default=7, help="random items per list each step: search queries, and each expand list (0 = all; default 7)")
     e = sp.add_parser("expand"); e.add_argument("--max-related", type=int, default=40)
     e.add_argument("--max-pages", type=int, default=6)
+    e.add_argument("--sample", type=int, default=7, help="random items per list each step: search queries, and each expand list (0 = all; default 7)")
     rc = sp.add_parser("recheck"); rc.add_argument("--days", type=float, default=3)
     ar = sp.add_parser("archive", help="save evidence folders for bait pins")
     ar.add_argument("--dir", default="archive")
@@ -940,7 +1059,11 @@ def main():
     ru.add_argument("--rounds", type=int, default=2, help="expand rounds")
     ru.add_argument("--max-pages", type=int, default=6)
     ru.add_argument("--max-related", type=int, default=40)
+    ru.add_argument("--sample", type=int, default=7, help="random items per list each step: search queries, and each expand list (0 = all; default 7)")
     ru.add_argument("--query", action="append", default=[])
+    ru.add_argument("--queries", default="queries.txt", help="queries file (default: queries.txt)")
+    ru.add_argument("--no-update-queries", action="store_true",
+                    help="don't append learned phrases to the queries file")
     ru.add_argument("--no-discover", action="store_true",
                     help="don't look for new pins (same as --no-search --no-expand)")
     ru.add_argument("--no-archive", action="store_true")
@@ -966,9 +1089,25 @@ def main():
     elif args.cmd == "profiles":
         step_profiles(db, api, args.force)
     elif args.cmd == "search":
-        step_search(db, api, (args.query if args.only else DEFAULT_QUERIES + args.query), args.max_pages)
+        qs = args.query if args.only else load_queries(args.queries) + args.query
+        log(f"[search] using {'--query only' if args.only else args.queries}")
+        step_search(db, api, list(dict.fromkeys(qs)), args.max_pages, args.sample)
+    elif args.cmd == "queries":
+        if args.update:
+            update_queries(db, args.queries, args.dry_run, args.min_count)
+        else:
+            stats = {r["query"]: r for r in db.q(
+                "SELECT query, COUNT(*) pages, SUM(bait_hits) hits, MAX(run_at) last FROM searches GROUP BY query")}
+            qs = load_queries(args.queries)
+            log(f"{len(qs)} queries in {args.queries}:")
+            for q in qs:
+                s_ = stats.get(q)
+                log(f"  {q!r}" + (f"   [new pins: {s_['hits']}, last run {s_['last'][:16]}]" if s_ else "   [never run]"))
+            pending = [q for q, n in derive_queries(db).items() if _qnorm(q) not in {_qnorm(x) for x in qs}]
+            if pending:
+                log(f"\n{len(pending)} new phrases could be learned from the db - run `queries --update`")
     elif args.cmd == "expand":
-        step_expand(db, api, args.max_related, args.max_pages)
+        step_expand(db, api, args.max_related, args.max_pages, args.sample)
     elif args.cmd == "recheck":
         cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=args.days)).isoformat()
         ids = [r["pin_id"] for r in db.q("SELECT pin_id FROM pins WHERE status IN ('ok','error') "
@@ -986,6 +1125,12 @@ def main():
         for r in db.q("SELECT status, COUNT(*) n FROM pins GROUP BY status"):
             log(f"  pins {r['status']}: {r['n']}")
         log(f"  bait pins with link: {db.q('SELECT COUNT(*) n FROM pins WHERE bait=1 AND link<>\"\"')[0]['n']}")
+        e = db.q("""SELECT COUNT(*) n, SUM(expand_new>0) found, SUM(expand_new=0 AND expand_seen>0) none_new,
+                    SUM(expand_seen=0) no_related, SUM(expanded_at IS NOT NULL AND expand_seen IS NULL) failed
+                    FROM pins WHERE expanded=1""")[0]
+        log(f"  expanded pins: {e['n']} (found new: {e['found'] or 0}, nothing new: {e['none_new'] or 0}, "
+            f"no related pins: {e['no_related'] or 0}, request failed: {e['failed'] or 0}, "
+            f"before tracking: {e['n'] - (e['found'] or 0) - (e['none_new'] or 0) - (e['no_related'] or 0) - (e['failed'] or 0)})")
     elif args.cmd == "clean":
         bad = [r["pin_id"] for r in db.q("SELECT pin_id FROM pins") if not PIN_ID_RE.fullmatch(r["pin_id"])]
         for i in range(0, len(bad), 500):
@@ -1000,17 +1145,23 @@ def main():
         start = now()
         step_fetch(db, api); step_resolve(db); step_profiles(db, api)
         if not args.no_search:
-            step_search(db, api, DEFAULT_QUERIES + args.query, args.max_pages)
+            if not args.no_update_queries:
+                update_queries(db, args.queries)
+            qs = list(dict.fromkeys(load_queries(args.queries) + args.query))
+            log(f"[search] {len(qs)} queries from {args.queries}")
+            step_search(db, api, qs, args.max_pages, args.sample)
             step_fetch(db, api)
         if not args.no_expand:
             for i in range(args.rounds):
                 log(f"===== expand round {i+1}/{args.rounds} =====")
                 before = db.q("SELECT COUNT(*) n FROM pins")[0]["n"]
-                step_expand(db, api, args.max_related, args.max_pages)
+                step_expand(db, api, args.max_related, args.max_pages, args.sample)
                 step_fetch(db, api)
                 if db.q("SELECT COUNT(*) n FROM pins")[0]["n"] == before:
                     log("  nothing new; stopping expansion"); break
         step_resolve(db); step_profiles(db, api)
+        if not args.no_search and not args.no_update_queries:
+            update_queries(db, args.queries)   # learn from pins found this run, ready for next time
         report(db, since=start)
         if not args.no_archive:
             step_archive(db, accounts=args.archive_accounts, wayback=args.wayback)
