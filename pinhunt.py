@@ -25,7 +25,7 @@ Individual steps
     status     quick counts
 """
 import argparse, collections, csv, datetime as dt, hashlib, importlib.util, json, os, re, shutil
-import sqlite3, subprocess, sys, time
+import random, sqlite3, subprocess, sys, time
 import urllib.error, urllib.parse, urllib.request
 from email.utils import parsedate_to_datetime
 
@@ -437,7 +437,9 @@ def step_profiles(db, api, force=False):
 
 
 def step_search(db, api, queries, max_pages):
-    log(f"[search] {len(queries)} queries x up to {max_pages} pages")
+    queries = list(queries)
+    random.shuffle(queries)   # vary order each run so early queries don't always get the fresh rate-limit budget
+    log(f"[search] {len(queries)} queries (shuffled) x up to {max_pages} pages")
     for q in queries:
         page, total_new = 0, 0
         try:
