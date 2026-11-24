@@ -56,6 +56,8 @@ SUSPECT_HOSTS = ("tinyurl.", "netlify.app", "bit.ly", "cutt.ly", "rb.gy", "short
                  "t.ly", "vercel.app", "github.io", "blogspot.", "sites.google.", "pages.dev",
                  "web.app", "firebaseapp.com", "tiny.cc", "s.id")
 
+PIN_ID_RE = re.compile(r"\d{5,20}")   # real pin IDs are numeric
+
 RESERVED_PATHS = {"pin", "search", "ideas", "today", "_", "settings", "business", "login",
                   "explore", "categories", "topics", "shopping", "videos", "news_hub", "about"}
 
@@ -278,8 +280,14 @@ def classify(link, chain, final):
 # ----------------------------------------------------------------- database
 class DB:
     def __init__(self, path):
-        self.c = sqlite3.connect(path)
+        # wait up to 2 min for locks held by other processes (viewer, second pinhunt run)
+        self.c = sqlite3.connect(path, timeout=120)
         self.c.row_factory = sqlite3.Row
+        try:
+            self.c.execute("PRAGMA journal_mode=WAL")   # readers no longer block writers
+            self.c.execute("PRAGMA busy_timeout=120000")
+        except sqlite3.OperationalError:
+            pass
         self.c.executescript(SCHEMA)
         for table, col in (("pins", "archived_at"), ("pins", "archive_dir"), ("users", "archived_at")):
             cols = {r[1] for r in self.c.execute(f"PRAGMA table_info({table})")}
@@ -325,6 +333,8 @@ def ingest_items(db, items, source, src_pin=None, edge_kind=None):
     for it in items:
         if not it.get("id") or it.get("type", "pin") != "pin":
             continue
+        if not PIN_ID_RE.fullmatch(str(it["id"])):   # skip promoted/encoded items like "e1_Afq..."
+            continue
         title = txt(it.get("title") or it.get("grid_title"))
         desc = txt(it.get("description"), 500)
         board = txt((it.get("board") or {}).get("name"))
@@ -340,6 +350,13 @@ def ingest_items(db, items, source, src_pin=None, edge_kind=None):
 # ----------------------------------------------------------------- steps
 def step_fetch(db, api, ids=None):
     rows = ids or [r["pin_id"] for r in db.q("SELECT pin_id FROM pins WHERE status='new'")]
+    skipped = [p for p in rows if not PIN_ID_RE.fullmatch(p)]
+    rows = [p for p in rows if PIN_ID_RE.fullmatch(p)]
+    if skipped:
+        db.x(f"UPDATE pins SET status='invalid' WHERE pin_id IN ({','.join('?' * len(skipped))})", *skipped)
+        db.commit()
+        log(f"[fetch] skipped {len(skipped)} non-numeric IDs (promoted/encoded items); "
+            f"run `clean` to delete them")
     log(f"[fetch] {len(rows)} pins")
     for n, pid in enumerate(rows, 1):
         try:
@@ -914,6 +931,7 @@ def main():
     ar.add_argument("--pin", action="append", default=[], help="only these pin IDs")
     sp.add_parser("report")
     sp.add_parser("status")
+    sp.add_parser("clean", help="delete non-numeric junk IDs (e1_...) from the database")
     ru = sp.add_parser("run", help="default full procedure")
     ru.add_argument("--no-search", action="store_true")
     ru.add_argument("--no-expand", action="store_true")
@@ -921,6 +939,8 @@ def main():
     ru.add_argument("--max-pages", type=int, default=6)
     ru.add_argument("--max-related", type=int, default=40)
     ru.add_argument("--query", action="append", default=[])
+    ru.add_argument("--no-discover", action="store_true",
+                    help="don't look for new pins (same as --no-search --no-expand)")
     ru.add_argument("--no-archive", action="store_true")
     ru.add_argument("--archive-accounts", action="store_true")
     ru.add_argument("--wayback", action="store_true")
@@ -964,7 +984,17 @@ def main():
         for r in db.q("SELECT status, COUNT(*) n FROM pins GROUP BY status"):
             log(f"  pins {r['status']}: {r['n']}")
         log(f"  bait pins with link: {db.q('SELECT COUNT(*) n FROM pins WHERE bait=1 AND link<>\"\"')[0]['n']}")
+    elif args.cmd == "clean":
+        bad = [r["pin_id"] for r in db.q("SELECT pin_id FROM pins") if not PIN_ID_RE.fullmatch(r["pin_id"])]
+        for i in range(0, len(bad), 500):
+            chunk = bad[i:i + 500]; ph = ",".join("?" * len(chunk))
+            db.x(f"DELETE FROM pins WHERE pin_id IN ({ph})", *chunk)
+            db.x(f"DELETE FROM edges WHERE dst IN ({ph}) OR src IN ({ph})", *chunk, *chunk)
+        db.commit()
+        log(f"deleted {len(bad)} non-numeric pin entries (and their edges)")
     elif args.cmd == "run":
+        if args.no_discover:
+            args.no_search = args.no_expand = True
         start = now()
         step_fetch(db, api); step_resolve(db); step_profiles(db, api)
         if not args.no_search:
