@@ -10,10 +10,12 @@ library.
 
 ## Safety
 
-- **Ad destinations are never opened.** The tool follows URL shorteners only with
+- **`pinhunt.py` never opens ad destinations.** It follows URL shorteners only with
   `HEAD` / `GET` without redirects, and decodes `google.com/url?q=…` wrappers offline. The
   final smartlink pages (`/<id>?key=<32 hex>` on throwaway domains) and `*.netlify.app`
-  tracker pages are never requested. Don't open them in a browser either.
+  tracker pages are only opened by the separate `probe.py`, and only with `--yes-i-know`,
+  in a sandboxed headless browser behind a proxy (see below). Don't open them in your own
+  browser.
 - **Pinterest is queried gently**, with a delay between requests (`--delay`, default 1.5 s)
   and back-off on 403/429.
 - **The evidence archive contains stolen photos of real people.** It is git-ignored and
@@ -37,12 +39,33 @@ library.
 A second, apparently separate scheme uses fashion/anime bait ("Tap the image link to get
 the exact look…") that links to `*.netlify.app` tracker pages.
 
+### How they earn (inferred)
+
+The final pages are never opened, so this is inferred from the link structure:
+
+- **Selling clicks.** The free Pinterest traffic is sold to ad networks. A smartlink's `key` is the
+  spammer's publisher ID. The network sends each visitor to whichever offer pays best for their
+  country and device (dating or cam sign-ups, sweepstakes, fake virus warnings, app installs,
+  browser-notification subscriptions) and pays per view or per conversion. Bots and unwanted
+  countries are filtered out, which is why the final page sometimes just closes.
+- **Rotation.** Domains rotate because they get blocklisted; many keys let one publisher track
+  earnings per account or batch, so a single ban costs little.
+- **Other link types.** `auctionr.org/4/…` looks like a second ad network's direct link, the
+  netlify pages look like an affiliate tracker that records which Pinterest search led to the
+  click, and a blogspot page with `utm_campaign` tags probably earns from its own ads.
+- **Economics.** Each click is worth very little, but accounts, posting and images cost nothing,
+  so volume makes it pay. Reporting the keys and domains to the ad networks can cut the payouts,
+  alongside reporting the accounts to Pinterest.
+
 ## Requirements
 
 - Python 3.9+
 - Optional: [`gallery-dl`](https://github.com/mikf/gallery-dl), to download pin media
   into the archive. Without it, a basic image download is used instead.
 - Optional: `pixboards`, to build a local HTML picture board from the archived images.
+- Optional, for `probe.py`: [Playwright](https://playwright.dev/python/) with Chromium
+  (`pip install playwright && python3 -m playwright install chromium`),
+  [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`), and a proxy or VPN.
 
 ## Quick start
 
@@ -90,6 +113,33 @@ Useful flags:
 - `--no-archive`, `--no-pics`, `--archive-accounts`, `--wayback`: control the archive step.
 - `--no-update-queries`: don't add learned phrases to `queries.txt`.
 
+## Probing destinations (`probe.py`)
+
+`probe.py` opens the final destinations in a headless browser to record what they actually
+serve. Without `--yes-i-know` it only lists what it would visit.
+
+```sh
+python3 probe.py                                    # dry run: list targets
+python3 probe.py --yes-i-know --proxy socks5://127.0.0.1:1080 --max 3
+python3 probe.py --list                             # stored results
+```
+
+- **Targets** come from `pinhunt.db`: one per smartlink key, per netlify tracker host, and per
+  other destination URL, interleaved by domain. A target is skipped once it has been probed
+  `--per-key` times (default 1). `--domain`, `--key`, `--kind` and `--url` narrow the choice.
+- **Sandbox**: the browser runs under bubblewrap with a read-only root, an empty home folder
+  and `/tmp`, and only the run's output folder writable, so it can't see the project or the
+  database. It needs `--proxy` (or an explicit `--direct`).
+- **Each visit** uses a fresh browser context with a mobile user agent and a
+  `pinterest.com` referrer. Permissions are denied; downloads, service workers, popups and
+  notification or push requests are blocked and logged; nothing is clicked or typed.
+  `--locale` / `--timezone` should match the proxy's country.
+- **Recorded** in `probes/<run>/<n>/`: `screenshot.png`, `page.html`, `traffic.har.zip`
+  and `result.json` (redirect chain, final URL, title, script hosts, URL parameters such as
+  `sub_id` / `clickid`, page events). Results also go into the `probes` table and a
+  "Destination probes" section of `report.md`. `probes/` is git-ignored.
+- `--chromium PATH` uses a different Chromium build if Playwright's own isn't installed.
+
 ## Files
 
 | path            | contents                                                           | in git? |
@@ -100,7 +150,9 @@ Useful flags:
 | `queries.txt`   | search phrases, one per line, `#` for comments                     | no      |
 | `report.md`     | generated report: domains, keys, accounts, batches, timelines      | no      |
 | `pins.csv`      | generated table of all pins                                        | no      |
+| `probe.py`      | sandboxed browser probe of destinations (opt-in)                   | yes     |
 | `archive/`      | evidence folders per pin, `index.md`, and the `_pics` board        | no      |
+| `probes/`       | probe screenshots, HAR files and results                           | no      |
 
 Each `archive/pins/<pin_id>/` holds `summary.md`, `pin.json`, `redirect_chain.json`,
 `poster_profile.json`, `poster_boards.json`, `page.html`, `media/` and a SHA-256

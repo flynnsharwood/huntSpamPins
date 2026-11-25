@@ -3,6 +3,8 @@
 /archive/
 /report.md
 /pins.csv
+# probe.py output: screenshots / HAR of ad pages (may show explicit offers)
+/probes/
 
 # SQLite side files (pinhunt.db itself is tracked as a backup)
 *.db-journal

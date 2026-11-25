@@ -1382,6 +1382,21 @@ def report(db, out_md="report.md", out_csv="pins.csv", since=None):
             P(f"- {r['pin_id']} — {r['pinner']} — board `{r['board_name']}` — title `{r['title'][:50]}` "
               f"— repin={r['is_repin']}")
 
+    if db.q("SELECT 1 FROM sqlite_master WHERE type='table' AND name='probes'"):
+        pr = db.q("""SELECT probed_at, proxy, key, group_id, target, final_domain, category, title,
+                     events, error FROM probes ORDER BY probed_at DESC""")
+        if pr:
+            P(f"\n## Destination probes (sandboxed browser visits via `probe.py`, {len(pr)})\n")
+            T = []
+            for r in pr:
+                ev = collections.Counter(e.get("event") for e in json.loads(r["events"] or "[]")
+                                         if e.get("event") != "beforeunload")
+                T.append([(r["probed_at"] or "")[:16], r["proxy"], r["key"][:12] or r["group_id"][:40],
+                          urllib.parse.urlparse(r["target"] or "").hostname or "", r["final_domain"],
+                          r["category"], (r["title"] or "")[:60],
+                          ', '.join(f"{k} ×{v}" for k, v in sorted(ev.items())), r["error"] or ""])
+            P(md_table(["probed (UTC)", "via", "key / target", "start host", "final domain", "category",
+                        "page title", "page events", "error"], T, "lllllllll"))
     qs = db.q("""SELECT query, COUNT(DISTINCT substr(run_at,1,16)) runs, SUM(results) results,
                  SUM(bait_hits) new_pins, MAX(run_at) last FROM searches GROUP BY query
                  ORDER BY new_pins DESC""")
