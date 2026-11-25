@@ -131,12 +131,14 @@ python3 probe.py --list                             # stored results
 
 - **Targets** come from `pinhunt.db`: one per smartlink key, per netlify tracker host, and per
   other destination URL, interleaved by domain. A target is skipped once it has been probed
-  `--per-key` times (default 1). `--domain`, `--key`, `--kind` and `--url` narrow the choice.
+  `--per-key` times (default 1); errors, blank pages and "proxy detected" pages don't count. `--domain`, `--key`, `--kind` and `--url` narrow the choice.
 - **Sandbox**: the browser runs under bubblewrap with a read-only root, an empty home folder
   and `/tmp`, and only the run's output folder writable, so it can't see the project or the
   database. It needs a proxy (from the settings file or `--proxy`), or an explicit `--direct`.
-- **Each visit** uses a fresh browser context with a mobile user agent and a
-  `pinterest.com` referrer. Permissions are denied; downloads, service workers, popups and
+- **Each visit** starts at the pin's original link (tinyurl → google.com/url → destination,
+  like a real click; `--start final` goes straight to the destination) and uses a fresh
+  browser context posing as Android Chrome (user agent and client hints, no "HeadlessChrome")
+  with a `pinterest.com` referrer. Permissions are denied; downloads, service workers, popups and
   notification or push requests are blocked and logged; nothing is clicked or typed.
   `--locale` / `--timezone` should match the proxy's country.
 - **Recorded** in `probes/<run>/<n>/`: `screenshot.png`, `page.html`, `traffic.har.zip`

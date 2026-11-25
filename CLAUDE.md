@@ -173,6 +173,29 @@ Corrections to the list above: accounts do NOT post one bait pin, and keys are N
   body → visit filtered (proxy / headless / geo), matching the "opens and closes" observation.
 - **auctionr.org/4/…**: timed out through the proxy (`ERR_TIMED_OUT`); will be retried.
 - Free proxies are unreliable: of ~200 listed Indian proxies ~13 answered once, 1 stayed up.
+- **Why the screenshots were white** (checked from the HAR): the pages really were blank. The
+  first probe sent `sec-ch-ua: "HeadlessChrome"` on every request (an obvious bot signal -
+  likely why walkingdrunkard returned an empty body), the netlify page is empty until
+  statistictracker core.js runs (it timed out after 18 s, but the probe had stopped waiting), and
+  the proxy took 7-14 s per connection. Fixed in probe.py: full Chromium in new headless mode,
+  client hints / `navigator.userAgentData` spoofed as Android Chrome via CDP, settle waits until
+  no request is pending, longer timeouts (60 / 45 / 8 s), visits start at the pin's original
+  link (tinyurl → google/url → destination, `--start link`, like a real visitor), and
+  `--direct` now overrides the proxy file (before, it silently used the file's proxy).
+- **Second probe** (same 3 targets, fixed browser, free SOCKS5 proxy exiting in IN): all three
+  answered **"Anonymous Proxy detected."** (walkingdrunkard 118-byte page; auctionr.org and
+  nolatec.org identical 1232-byte Cloudflare-fronted page). → free/public proxies are on the
+  networks' blocklists; a clean (residential/mobile or good VPN) IP is needed to see offers.
+- **Netlify chain revealed** (912469d--unrivaled-piroshki): netlify decoy page →
+  `statistictracker.com/counter/core.js` → `912469d--unrivaled-piroshki-4fdf47.statistictracker.com/
+  <same path>` (subdomain = netlify site name) → `goldenthis.com/<same path>` (loads
+  `json.php?kampid=3582&i=16223`, "trendroad" favicon, beacon to `stat.ideasthings.com/ac.php`
+  with all path params) → **`nolatec.org/4/<32 hex>`**. The final hop has the same `/4/<32 hex>`
+  format and the same proxy-block page as `auctionr.org/4/…` → **the netlify scheme and the
+  auctionr links end in the same ad network**, so "separate scheme / different operator" for
+  netlify is less certain: at least the monetisation is shared.
+- The tinyurl → `google.com/url` (200 + JS redirect) → destination chain behaves in a real browser
+  exactly as decoded offline.
 
 ## Open tasks / ideas
 
@@ -215,9 +238,10 @@ Corrections to the list above: accounts do NOT post one bait pin, and keys are N
    re-run `python3 -m playwright install chromium` (or use `--chromium PATH`).
    Proxy settings in `probe_proxy.json` (git-ignored; example `probe_proxy.example.json`);
    per-key limit counts per proxy label, failed visits don't count.*
-12. Probe results are thin through free Indian proxies (see findings). Decide later whether to
-   switch to a US endpoint (locale en-US, timezone America/New_York) or a better proxy; probe
-   `statistictracker.com/counter/core.js` behaviour once a proxy loads it.
+12. Probe results are thin through free proxies: every destination answers "Anonymous Proxy
+   detected". Needs a clean IP (residential/mobile, or a VPN not on blocklists). Decide later whether to
+   switch to a US endpoint (locale en-US, timezone America/New_York). Blocked / blank / error
+   visits don't count toward `--per-key`, so the same targets are retried automatically.
 
 ## Project files
 

@@ -22,7 +22,7 @@ Usage:
   python3 probe.py --list                  # show stored probe results
 """
 import argparse, collections, datetime, json, os, re, shutil, sqlite3, subprocess, sys, time
-import urllib.parse
+import urllib.parse, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 UA_DEVICE = "Pixel 7"
@@ -64,9 +64,26 @@ def host(u):
         return ""
 
 
+WARP_TRACE = "https://www.cloudflare.com/cdn-cgi/trace"
+
+
+def warp_status():
+    """Ask Cloudflare's trace page whether this machine's traffic goes through WARP (system-wide
+    tunnel). Returns (on, country, ip); on is False if the check fails."""
+    try:
+        with urllib.request.urlopen(WARP_TRACE, timeout=15) as r:
+            kv = dict(line.split("=", 1) for line in r.read().decode().splitlines() if "=" in line)
+    except Exception as e:
+        print(f"WARP check failed: {e}")
+        return False, "?", ""
+    return kv.get("warp") in ("on", "plus"), kv.get("loc", "?"), kv.get("ip", "")
+
+
 def redact_proxy(p):
     if not p:
         return "direct"
+    if p == "warp":
+        return "warp"
     u = urllib.parse.urlparse(p)
     return f"{u.scheme}://{u.hostname}:{u.port}" if u.hostname else p
 
@@ -74,6 +91,8 @@ def redact_proxy(p):
 def categorise(title, text, url, error=None):
     if error or (url or "").startswith("chrome-error:"):
         return "error"
+    if re.search(r"(anonymous )?proxy detected|vpn detected|access denied", (text or "")[:500], re.I):
+        return "blocked: proxy / VPN detected"
     if not (title or "").strip() and not (text or "").strip():
         return "blank page (likely filtered: bot / proxy / geo)"
     blob = " ".join([title or "", text or "", url or ""]).lower()
@@ -93,14 +112,15 @@ def db_open(path):
 def targets(con, per_key=1, domain=None, only_key=None, kinds=None, proxy_label=None):
     """One destination per key (smartlinks) / per URL path (auctionr, netlify, others), skipping
     groups already probed per_key times successfully through the same proxy (so switching proxy /
-    country probes them again). Newest pins first."""
+    country probes them again; errors, blank and proxy-blocked pages don't count). Newest first."""
     rows = con.execute("""
         SELECT l.link, l.final_url, l.final_domain, l.key, l.kind, l.path, MAX(p.created_at) AS last
         FROM links l JOIN pins p ON p.link = l.link
         WHERE l.final_url IS NOT NULL AND l.final_url != '' AND p.bait = 1
         GROUP BY l.link ORDER BY last DESC""").fetchall()
     done = collections.Counter(r[0] for r in con.execute(
-        "SELECT group_id FROM probes WHERE (error IS NULL OR error = '') AND (? IS NULL OR proxy = ?)",
+        "SELECT group_id FROM probes WHERE (error IS NULL OR error = '') AND category NOT LIKE 'blocked%' "
+        "AND category NOT LIKE 'blank%' AND category != 'error' AND (? IS NULL OR proxy = ?)",
         (proxy_label, proxy_label)))
     seen, out = set(), []
     for r in rows:
@@ -195,7 +215,6 @@ INIT_JS = r"""
   } catch (e) {}
   try { window.open = function (u) { log('window.open', u); return null; }; } catch (e) {}
   try { navigator.clipboard.writeText = function (t) { log('clipboard.writeText', t); return Promise.resolve(); }; } catch (e) {}
-  for (const ev of ['beforeunload']) window.addEventListener(ev, () => log(ev, location.href));
 })();
 """
 
@@ -211,6 +230,8 @@ def child(task_file):
         launch = {"headless": True, "args": ["--disable-blink-features=AutomationControlled"]}
         if job.get("chromium"):
             launch["executable_path"] = job["chromium"]
+        else:
+            launch["channel"] = "chromium"              # full Chromium, new headless mode
         if job["proxy"]:
             u = urllib.parse.urlparse(job["proxy"])
             launch["proxy"] = {"server": f"{u.scheme}://{u.hostname}:{u.port}"}
@@ -234,9 +255,26 @@ def child(task_file):
         browser.close()
 
 
+def spoof_client_hints(ctx, page, device, job):
+    """Headless Chromium announces itself as "HeadlessChrome" in the sec-ch-ua header and in
+    navigator.userAgentData - an easy bot signal. Present a normal Android Chrome instead."""
+    m = re.search(r"Chrome/(\d+)", device["user_agent"])
+    major = m.group(1) if m else "130"
+    brands = [{"brand": "Chromium", "version": major}, {"brand": "Google Chrome", "version": major},
+              {"brand": "Not/A)Brand", "version": "8"}]
+    meta = {"brands": brands, "fullVersionList": [dict(b, version=b["version"] + ".0.0.0") for b in brands],
+            "fullVersion": f"{major}.0.0.0", "platform": "Android", "platformVersion": "14.0.0",
+            "architecture": "", "model": "Pixel 7", "mobile": True, "bitness": "", "wow64": False}
+    cdp = ctx.new_cdp_session(page)
+    cdp.send("Network.setUserAgentOverride", {"userAgent": device["user_agent"],
+                                              "acceptLanguage": job["locale"],
+                                              "platform": "Linux armv81", "userAgentMetadata": meta})
+
+
 def visit(browser, device, task, d, job, PWError):
     task["probed_at"] = now()
     nav, events, scripts, main, failed_reqs = [], [], set(), [], []
+    pending = set()
     hosts = collections.Counter()
     ctx = browser.new_context(**device, locale=job["locale"], timezone_id=job["timezone"],
                               permissions=[], accept_downloads=False, service_workers="block",
@@ -247,6 +285,7 @@ def visit(browser, device, task, d, job, PWError):
     ctx.add_init_script(INIT_JS)
 
     def on_request(req):
+        pending.add(req)
         hosts[host(req.url)] += 1
         if req.is_navigation_request() and req.frame == req.frame.page.main_frame:
             nav.append({"url": req.url, "method": req.method,
@@ -271,13 +310,17 @@ def visit(browser, device, task, d, job, PWError):
             pass
 
     ctx.on("request", on_request)
-    ctx.on("requestfailed", lambda req: failed_reqs.append(
-        {"url": req.url, "type": req.resource_type, "error": req.failure}))
+    def on_failed(req):
+        pending.discard(req)
+        failed_reqs.append({"url": req.url, "type": req.resource_type, "error": req.failure})
+    ctx.on("requestfailed", on_failed)
+    ctx.on("requestfinished", lambda req: pending.discard(req))
     ctx.on("response", on_response)
     ctx.on("page", on_page)
     ctx.on("dialog", lambda dl: (events.append({"t": now(), "event": f"dialog.{dl.type}",
                                                 "value": dl.message, "frame": ""}), dl.dismiss()))
     page = ctx.new_page()
+    spoof_client_hints(ctx, page, device, job)
     page.on("download", lambda dl: (events.append({"t": now(), "event": "download",
                                                    "value": dl.suggested_filename, "frame": ""}),
                                     dl.cancel()))
@@ -287,17 +330,19 @@ def visit(browser, device, task, d, job, PWError):
                   timeout=job["timeout"] * 1000)
     except PWError as e:
         res["goto_error"] = str(e).splitlines()[0][:300]
-    # let JS / meta-refresh redirects happen; stop early when the URL is stable
-    end, last, stable_since = time.time() + job["settle"], None, time.time()
+    # let scripts load and JS / meta-refresh redirects happen; stop early once the URL has been
+    # unchanged and no request has been pending for `stable` seconds
+    end, last, quiet_since = time.time() + job["settle"], None, time.time()
     while time.time() < end:
         try:
             page.wait_for_timeout(500)
         except PWError:
             break
-        if page.url != last:
-            last, stable_since = page.url, time.time()
-        elif time.time() - stable_since > job["stable"]:
+        if page.url != last or pending:
+            last, quiet_since = page.url, time.time()
+        elif time.time() - quiet_since > job["stable"]:
             break
+    res["pending_at_end"] = sorted(r.url for r in pending)[:20]
     try:
         res["final_url"] = page.url
         res["title"] = page.title()
@@ -372,20 +417,24 @@ def main():
                     help="JSON file with proxy / locale / timezone (default %(default)s)")
     ap.add_argument("--proxy", help="proxy URL, e.g. socks5://host:port or http://user:pass@host:port "
                                     "(overrides the proxy file)")
-    ap.add_argument("--direct", action="store_true", help="allow visiting without a proxy (your own IP!)")
+    ap.add_argument("--direct", action="store_true",
+                    help="visit without any proxy, ignoring the proxy file (your own IP!)")
     ap.add_argument("--no-sandbox", action="store_true", help="don't wrap the browser in bubblewrap")
     ap.add_argument("--max", type=int, default=3, help="max visits this run (default %(default)s)")
     ap.add_argument("--per-key", type=int, default=1,
                     help="max successful visits per key / target group overall (default %(default)s)")
     ap.add_argument("--delay", type=float, default=20, help="seconds between visits (default %(default)s)")
-    ap.add_argument("--timeout", type=float, default=30, help="page load timeout, s (default %(default)s)")
-    ap.add_argument("--settle", type=float, default=20, help="max wait for JS redirects, s (default %(default)s)")
-    ap.add_argument("--stable", type=float, default=5, help="stop when the URL is unchanged this long, s")
+    ap.add_argument("--timeout", type=float, default=60, help="page load timeout, s (default %(default)s)")
+    ap.add_argument("--settle", type=float, default=45, help="max wait for JS redirects, s (default %(default)s)")
+    ap.add_argument("--stable", type=float, default=8, help="stop when the URL is unchanged this long, s")
     ap.add_argument("--chromium", help="Chromium executable to use instead of Playwright's own build")
     ap.add_argument("--locale", help="browser locale (default: proxy file, else en-US)")
     ap.add_argument("--timezone", help="should match the proxy's country "
                                        "(default: proxy file, else America/New_York)")
     ap.add_argument("--referer", default=REFERER)
+    ap.add_argument("--start", choices=("link", "final"), default="link",
+                    help="start at the pin's original link (tinyurl etc., like a real visitor; default) "
+                         "or directly at the stored final destination")
     ap.add_argument("--domain", help="only targets whose final domain contains this")
     ap.add_argument("--key", help="only this smartlink key")
     ap.add_argument("--kind", action="append", help="only link kinds starting with this (repeatable)")
@@ -394,10 +443,21 @@ def main():
     args = ap.parse_args()
 
     cfg = load_proxy_file(args.proxy_file)
-    args.proxy = args.proxy or cfg.get("proxy")
+    if args.direct and args.proxy:
+        sys.exit("--direct and --proxy contradict each other")
+    args.proxy = None if args.direct else (args.proxy or cfg.get("proxy"))
     args.locale = args.locale or cfg.get("locale") or "en-US"
     args.timezone = args.timezone or cfg.get("timezone") or "America/New_York"
     country = cfg.get("country", "?") if args.proxy == cfg.get("proxy") else "?"
+    warp = args.proxy == "warp"
+    if warp:
+        # WARP as a system-wide tunnel: no proxy in the browser, but only run while WARP is on,
+        # so a dropped tunnel never falls back to the home IP. Country comes from Cloudflare.
+        on, country, ip = warp_status()
+        if not on:
+            sys.exit("proxy is \"warp\" but Cloudflare reports WARP is off - refusing to visit "
+                     "(check `warp-cli status`)")
+        print(f"WARP on, exit {country} ({ip})")
     label = redact_proxy(args.proxy) + (f" [{country}]" if args.proxy and country != "?" else "")
     con = db_open(args.db)
     if args.list:
@@ -406,6 +466,9 @@ def main():
         tasks = [{"target": u, "link": None, "key": "", "group_id": u, "kind": "manual"} for u in args.url]
     else:
         tasks = targets(con, args.per_key, args.domain, args.key, args.kind, label)
+        if args.start == "link":
+            for t in tasks:
+                t["destination"], t["target"] = t["target"], t["link"] or t["target"]
     tasks = tasks[:args.max] if args.max > 0 else tasks
     print(f"{len(tasks)} target(s):")
     for t in tasks:
@@ -423,7 +486,7 @@ def main():
     os.makedirs(run_dir)
     for t in tasks:
         t["probed_at"] = None
-    job = {"tasks": tasks, "proxy": args.proxy, "proxy_label": label,
+    job = {"tasks": tasks, "proxy": None if warp else args.proxy, "proxy_label": label,
            "locale": args.locale, "timezone": args.timezone, "referer": args.referer,
            "chromium": args.chromium, "delay": args.delay, "timeout": args.timeout, "settle": args.settle, "stable": args.stable}
     task_file = os.path.join(run_dir, "job.json")
