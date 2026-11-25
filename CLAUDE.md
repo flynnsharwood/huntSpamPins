@@ -139,7 +139,7 @@ Corrections to the list above: accounts do NOT post one bait pin, and keys are N
   :00-:03 or :30-:34 - same pattern as lisandra_mitchell6085 → probably one netlify operator with
   one host per account, despite no shared signal.
 
-## How the operators earn (inferred from link structure; first probes below confirm little yet)
+## How the operators earn (inferred from link structure; confirmed in part by the WARP probe below)
 
 - **Traffic arbitrage**: free Pinterest clicks (stolen suggestive photos + search ranking) are sold to
   ad networks. Account farms, warm-up and bursts exist to keep traffic flowing despite bans.
@@ -196,6 +196,23 @@ Corrections to the list above: accounts do NOT post one bait pin, and keys are N
   netlify is less certain: at least the monetisation is shared.
 - The tinyurl → `google.com/url` (200 + JS redirect) → destination chain behaves in a real browser
   exactly as decoded offline.
+- **Third probe via Cloudflare WARP (exit IN, Delhi) - not blocked; first real offers seen:**
+  - **netlify** → statistictracker → goldenthis → `nolatec.org/4/95ec686b…` →
+    `hiiltrack.online/click.php?key=d52a5083…&PLACEMENT_ID=24929231&COUNTRY=IN…` →
+    `meetsweetmeet.online/l4-banners-1/` - porn landing page pushing an Android app
+    "FlickBrowser" ("Download videos…", fake 4.5★, "Install free") → **CPI app-install offer**.
+  - **walkingdrunkard smartlink** (key 249c6b2a…) → `walkingdrunkard.com/api/users?token=<base64>`
+    (302) → `vidios.top/visit/<uuid>?placement_id=30199660&campaign_id=1548717&banner_id=3974420…`
+    → `proprize.club/pop-verify?country=IN…` - **prize/sweepstakes scam**; Chrome stopped it with
+    its "Form is not secure" interstitial. A `protrafficinspector.com/stats` bot check runs first.
+  - **auctionr.org/4/e607f497…** → `toolaris-app.com/preland/storage/ut/neuro/2/` - fake
+    social-profile pre-lander for the **"Neuro" browser app** on Google Play
+    (`com.neurobro.browser`, `utm_medium=affiliate`, `utm_source=all_99_1363750`); tried to
+    register a service worker (push notifications). Same `fstu` / `st1` / `static.nresystems.com`
+    parameters and scripts on auctionr.org and nolatec.org → same ad network.
+  - Confirms the "how they earn" section: traffic is sold via smartlinks / direct links whose
+    ad networks route Indian mobile visitors to app-install (CPI) and sweepstakes offers.
+    WARP IPs are not on these networks' proxy blocklists (free proxies are).
 
 ## Open tasks / ideas
 
@@ -238,9 +255,10 @@ Corrections to the list above: accounts do NOT post one bait pin, and keys are N
    re-run `python3 -m playwright install chromium` (or use `--chromium PATH`).
    Proxy settings in `probe_proxy.json` (git-ignored; example `probe_proxy.example.json`);
    per-key limit counts per proxy label, failed visits don't count.*
-12. Probe results are thin through free proxies: every destination answers "Anonymous Proxy
-   detected". Needs a clean IP (residential/mobile, or a VPN not on blocklists). Decide later whether to
-   switch to a US endpoint (locale en-US, timezone America/New_York). Blocked / blank / error
+12. [x] Free proxies are blocked ("Anonymous Proxy detected"); **WARP works** (`"proxy": "warp"` in
+   probe_proxy.json - runs only while WARP is on). Still open: compare with a US exit, and with a
+   mobile-carrier IP (phone hotspot), which is what real Pinterest visitors have. US endpoint:
+   locale en-US, timezone America/New_York. Blocked / blank / error
    visits don't count toward `--per-key`, so the same targets are retried automatically.
 
 ## Project files

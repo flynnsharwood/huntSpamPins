@@ -127,7 +127,10 @@ python3 probe.py --list                             # stored results
 
 - **Proxy settings** live in `probe_proxy.json` (git-ignored, may hold credentials; copy
   `probe_proxy.example.json`): `proxy`, `country`, `locale`, `timezone`. Command-line flags
-  override it. The per-key limit counts per proxy, so switching country probes targets again.
+  override it. `"proxy": "warp"` uses Cloudflare WARP running as a system-wide tunnel (the
+  probe checks Cloudflare's trace page and refuses to run if WARP is off). Free public proxies
+  are blocked by the ad networks ("Anonymous Proxy detected"); WARP is not. The per-key limit
+  counts per proxy, so switching country probes targets again.
 
 - **Targets** come from `pinhunt.db`: one per smartlink key, per netlify tracker host, and per
   other destination URL, interleaved by domain. A target is skipped once it has been probed

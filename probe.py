@@ -44,10 +44,12 @@ CATEGORIES = [
     ("fake virus / scareware", r"\b(virus|infected|malware|your (phone|device) is|clean(er)? now|"
                                r"security alert|battery is damaged)\b"),
     ("sweepstakes / prize", r"\b(congratulations|you (have )?won|winner|prize|gift card|reward|"
+                            r"pop-verify|"
                             r"spin the wheel|claim (now|your))\b"),
     ("dating / adult", r"\b(dating|hookup|singles|meet (women|girls|local)|horny|sex|cam(s|girl)?|"
-                       r"adult|18\+|nude|xxx|chat with)\b"),
-    ("app / vpn install", r"\b(install|download|vpn|app store|google play|update (required|now))\b"),
+                       r"adult|18\+|nude|xxx|chat with|porn|milf)\b"),
+    ("app / vpn install", r"\b(install|download|vpn|app store|google play|update (required|now))\b|"
+                          r"play\.google\.com|apps\.apple\.com|store/apps/details"),
     ("crypto / investing", r"\b(crypto|bitcoin|invest(ment)?|trading|profit)\b"),
     ("video / streaming", r"\b(watch (now|video|full)|stream(ing)?|play video|hd video)\b"),
 ]
@@ -91,13 +93,16 @@ def redact_proxy(p):
 def categorise(title, text, url, error=None):
     if error or (url or "").startswith("chrome-error:"):
         return "error"
+    url = urllib.parse.unquote(url or "")
     if re.search(r"(anonymous )?proxy detected|vpn detected|access denied", (text or "")[:500], re.I):
         return "blocked: proxy / VPN detected"
-    if not (title or "").strip() and not (text or "").strip():
-        return "blank page (likely filtered: bot / proxy / geo)"
     blob = " ".join([title or "", text or "", url or ""]).lower()
     cats = [c for c, rx in CATEGORIES if re.search(rx, blob)]
-    return ", ".join(cats) or "unknown"
+    if cats:
+        return ", ".join(cats)
+    if not (title or "").strip() and not (text or "").strip():
+        return "blank page (likely filtered: bot / proxy / geo)"
+    return "unknown"
 
 
 # ---------------------------------------------------------------- target selection (parent)
@@ -271,6 +276,21 @@ def spoof_client_hints(ctx, page, device, job):
                                               "platform": "Linux armv81", "userAgentMetadata": meta})
 
 
+def fix_chrome_error(res, nav):
+    """A chrome-error:// page after a real redirect chain (e.g. Chrome's "Form is not secure"
+    interstitial, or a blocked request) is not a failed visit: keep the last real URL as the
+    final URL and note the interstitial. Only a visit that never got anywhere is an error."""
+    if not (res.get("final_url") or "").startswith("chrome-error:"):
+        return
+    real = [n for n in nav if not n["url"].startswith("chrome-error:")]
+    if len(real) > 1 or (real and real[0].get("status")):
+        res["interstitial"] = res.get("title") or "chrome error page"
+        res["final_url"] = real[-1]["url"]
+        res["title"] = ""
+    else:
+        res["error"] = res.get("goto_error") or res.get("title") or "chrome error page"
+
+
 def visit(browser, device, task, d, job, PWError):
     task["probed_at"] = now()
     nav, events, scripts, main, failed_reqs = [], [], set(), [], []
@@ -362,8 +382,7 @@ def visit(browser, device, task, d, job, PWError):
         q = urllib.parse.parse_qs(urllib.parse.urlparse(n["url"]).query)
         if q:
             params[n["url"][:200]] = {k: v[0][:200] for k, v in q.items()}
-    if res.get("goto_error") and (not nav or (res.get("final_url") or "").startswith("chrome-error:")):
-        res["error"] = res["goto_error"]
+    fix_chrome_error(res, nav)
     failed = [r for r in failed_reqs if r["url"] != task["target"]]
     if failed:
         res["failed_requests"] = failed[:30]
@@ -395,6 +414,12 @@ PROXY_EXAMPLE = {
     "locale": "en-IN",
     "timezone": "Asia/Kolkata",
 }
+
+
+def exit_info():
+    """For --direct visits: label where this machine's traffic exits (shows if WARP is on)."""
+    on, country, _ = warp_status()
+    return f" [{country}{', warp' if on else ''}]" if country != "?" else ""
 
 
 def load_proxy_file(path):
@@ -459,6 +484,8 @@ def main():
                      "(check `warp-cli status`)")
         print(f"WARP on, exit {country} ({ip})")
     label = redact_proxy(args.proxy) + (f" [{country}]" if args.proxy and country != "?" else "")
+    if not args.proxy:
+        label = "direct" + exit_info()
     con = db_open(args.db)
     if args.list:
         return show(con, 50)
