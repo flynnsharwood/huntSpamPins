@@ -1084,9 +1084,15 @@ def link_attrs(r):
     return out
 
 
-def clusters(pins):
+WEAK_SIGNALS = {"image"}   # shared stolen photos can be reused by unrelated operators
+
+
+def clusters(pins, weak=WEAK_SIGNALS):
     """Connected components of operator accounts that share a key / auctionr id / tinyurl /
-    netlify host / image. Returns [(accounts, {signal type: number of shared values})]."""
+    netlify host. Weak signals (image) don't merge components; they are counted inside a
+    cluster and returned separately when they link different clusters.
+    Returns ([(accounts, {signal type: number of shared values})],
+             [(signal type, value, accounts, cluster indexes)])."""
     parent = {}
 
     def find(x):
@@ -1100,16 +1106,26 @@ def clusters(pins):
             continue
         a = ("acct", r["operator"]); find(a)
         for at in link_attrs(r):
-            parent[find(a)] = find(at); users_of[at].add(r["operator"])
+            users_of[at].add(r["operator"])
+            if at[0] not in weak:
+                parent[find(a)] = find(at)
     comps = collections.defaultdict(set)
     for x in list(parent):
         if x[0] == "acct":
             comps[find(x)].add(x[1])
-    out = []
-    for root, accts in comps.items():
-        shared = collections.Counter(at[0] for at, us in users_of.items() if len(us) > 1 and find(at) == root)
-        out.append((sorted(accts), dict(shared)))
-    return sorted(out, key=lambda c: (-len(c[0]), c[0]))
+    out = sorted(((sorted(accts), root) for root, accts in comps.items()), key=lambda c: (-len(c[0]), c[0]))
+    index = {root: i for i, (_, root) in enumerate(out)}
+    shared = [collections.Counter() for _ in out]
+    weak_links = []
+    for at, us in users_of.items():
+        if len(us) < 2:
+            continue
+        roots = {find(("acct", u)) for u in us}
+        if len(roots) == 1:
+            shared[index[roots.pop()]][at[0]] += 1
+        elif at[0] in weak:
+            weak_links.append((at[0], at[1], sorted(us), sorted(index[r] for r in roots)))
+    return [(a, dict(sh)) for (a, _), sh in zip(out, shared)], sorted(weak_links, key=lambda w: w[3])
 
 
 def waves(pins, gap_min=WAVE_GAP_MIN):
@@ -1249,8 +1265,8 @@ def report(db, out_md="report.md", out_csv="pins.csv", since=None):
     if unprofiled:
         P(f"\n{len(unprofiled)} operator accounts have no profile yet (run `profiles`): {', '.join(unprofiled)}")
 
-    P("\n## Clusters (operators sharing a key, auctionr id, tinyurl, netlify host or image)\n")
-    cl = clusters(bait)
+    P("\n## Clusters (operators sharing a key, auctionr id, tinyurl or netlify host)\n")
+    cl, weak_links = clusters(bait)
     multi = [c for c in cl if len(c[0]) > 1]
     if multi:
         P(md_table(["#", "accounts", "n", "bait pins", "shared signals", "domains", "first pin", "last pin"],
@@ -1262,6 +1278,14 @@ def report(db, out_md="report.md", out_csv="pins.csv", since=None):
                     for i, (a, sh) in enumerate(multi, 1)], "rlrrllll"))
     P(f"\n{len(cl) - len(multi)} operator accounts share no signal with any other account: "
       + ', '.join(a[0] for a, _ in cl if len(a) == 1))
+    if weak_links:
+        num = {i: str(n) for n, i in enumerate((i for i, (a, _) in enumerate(cl) if len(a) > 1), 1)}
+        P("\nWeak links between clusters (shared image only - possibly the same stolen photo reused, "
+          "not proof of one operator):\n")
+        P(md_table(["signal", "value", "accounts", "clusters"],
+                   [[sig, f"`{val}`", ', '.join(us),
+                     ', '.join(f"#{num[i]}" if i in num else cl[i][0][0] for i in idx)]
+                    for sig, val, us, idx in weak_links], "llll"))
 
     P(f"\n## Waves (an operator's bait pins at most {WAVE_GAP_MIN} min apart; savers' copies excluded)\n")
     wv = waves(bait)

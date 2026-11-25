@@ -110,7 +110,7 @@ Corrections to the list above: accounts do NOT post one bait pin, and keys are N
   113 waves of ≥2 pins. Warm-up n=751, median 18.9 days, 397 of 751 at 14-20 days.
 - Of the 13 operators known only through saved copies, 12 now have their own bait pins in the DB;
   only **enzolaith5189 (removed)** remains known only via a saver (finanzalex, formssternlystately.com).
-- **Clusters (shared key / auctionr id / tinyurl / netlify host / image), 8 multi-account:**
+- **Clusters (shared key / auctionr id / tinyurl / netlify host / image), 8 multi-account** (9 since task 10: images no longer merge, so janaam and clara are separate):
   janaam+clara (indyjanaam, neriahjanaam, makenziejanaam, jadeclara7425, lydaclara7425; 68 pins) ·
   blue (sageblue, anastasiablue, evieblue `391504`, aryablue; 50) ·
   nora (evienora4143, theanora4143, kaylanicora; 27, surelydecoratedfundraiser.com) ·
@@ -164,8 +164,10 @@ Corrections to the list above: accounts do NOT post one bait pin, and keys are N
    results, so `--prune` keeps them, but they add almost no new pins).
 9. [x] Next network run: `profiles` + `expand` to crawl the 13 operators found via saved copies.
    *Done 2026-11-25: expand of all 18 uncrawled operators, then fetch + resolve (821 pins).*
-10. `clusters()`: image signatures alone merged janaam + clara. Consider making image a weak
-   signal (list image-only links separately instead of merging components).
+10. [x] `clusters()`: image signatures alone merged janaam + clara. Make image a weak signal.
+   *Done: `WEAK_SIGNALS = {"image"}` - images no longer merge clusters; they are counted inside a
+   cluster, and image-only links between clusters are listed under "Weak links between clusters".
+   Result: 9 clusters, janaam (3) and clara (2) separate again, joined by 1 weak image link.*
 
 ## Project files
 
