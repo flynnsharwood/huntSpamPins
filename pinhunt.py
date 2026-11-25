@@ -876,6 +876,40 @@ def step_archive(db, root="archive", force=False, html=True, media=True, account
     log(f"[archive] index: {os.path.join(root, 'index.md')}")
 
 
+# ----------------------------------------------------------------- picture board
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+
+
+def step_pics(root="archive", board=True):
+    """Copy archived pin images into <root>/_pics, then run `pixboards` there to rebuild the local HTML board.
+    Never passes --upload / --gitPush: the images are stolen photos and must stay private."""
+    pics = os.path.join(root, "_pics")
+    os.makedirs(pics, exist_ok=True)
+    copied = 0
+    for base, _, files in os.walk(os.path.join(root, "pins")):
+        if os.path.basename(base) != "media":
+            continue
+        pid = os.path.basename(os.path.dirname(base))
+        for fn in files:
+            if os.path.splitext(fn)[1].lower() not in IMAGE_EXTS:
+                continue
+            name = fn if pid in fn else f"{pid}_{fn}"   # fallback_0.jpg etc. would collide between pins
+            src, dst = os.path.join(base, fn), os.path.join(pics, name)
+            if os.path.exists(dst) and os.path.getsize(dst) == os.path.getsize(src):
+                continue
+            shutil.copy2(src, dst); copied += 1
+    log(f"[pics] copied {copied} new images to {pics}")
+    if not board:
+        return
+    exe = shutil.which("pixboards")
+    if not exe:
+        log("[pics] pixboards not found on PATH; skipped building the board"); return
+    p = subprocess.run([exe], cwd=pics, capture_output=True, text=True)
+    log(f"[pics] pixboards exited {p.returncode}")
+    if p.returncode:
+        log((p.stdout + p.stderr)[-2000:])
+
+
 # ----------------------------------------------------------------- markdown tables
 def _width(s):
     """Approximate terminal/monospace display width (emoji and CJK = 2, combining marks/VS16/ZWJ = 0)."""
@@ -1084,6 +1118,9 @@ def main():
     ar.add_argument("--wayback", action="store_true", help="request Wayback Machine snapshots")
     ar.add_argument("--pin", action="append", default=[], help="only these pin IDs")
     sp.add_parser("report")
+    pc = sp.add_parser("pics", help="copy archived images to archive/_pics and run pixboards there")
+    pc.add_argument("--dir", default="archive")
+    pc.add_argument("--no-board", action="store_true", help="only copy, don't run pixboards")
     sp.add_parser("status")
     sp.add_parser("clean", help="delete non-numeric junk IDs (e1_...) from the database")
     ru = sp.add_parser("run", help="default full procedure")
@@ -1100,6 +1137,7 @@ def main():
     ru.add_argument("--no-discover", action="store_true",
                     help="don't look for new pins (same as --no-search --no-expand)")
     ru.add_argument("--no-archive", action="store_true")
+    ru.add_argument("--no-pics", action="store_true", help="don't copy images to archive/_pics / run pixboards")
     ru.add_argument("--archive-accounts", action="store_true")
     ru.add_argument("--wayback", action="store_true")
     args = ap.parse_args()
@@ -1147,6 +1185,8 @@ def main():
                                           "AND (fetched_at IS NULL OR fetched_at < ?)", cutoff)]
         step_fetch(db, api, ids); step_resolve(db); step_profiles(db, api, force=True); report(db)
         step_archive(db)  # archives anything new; index shows which archived pins are now removed
+    elif args.cmd == "pics":
+        step_pics(args.dir, not args.no_board)
     elif args.cmd == "archive":
         step_archive(db, args.dir, args.force, not args.no_html, not args.no_media,
                      args.accounts, args.wayback, args.pin or None)
@@ -1198,6 +1238,8 @@ def main():
         report(db, since=start)
         if not args.no_archive:
             step_archive(db, accounts=args.archive_accounts, wayback=args.wayback)
+            if not args.no_pics:
+                step_pics()
 
 
 if __name__ == "__main__":
