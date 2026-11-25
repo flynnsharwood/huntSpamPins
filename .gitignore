@@ -14,3 +14,5 @@
 # Python
 __pycache__/
 *.pyc
+# probe.py proxy settings (may hold credentials); see probe_proxy.example.json
+/probe_proxy.json

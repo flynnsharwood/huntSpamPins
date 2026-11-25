@@ -120,16 +120,21 @@ serve. Without `--yes-i-know` it only lists what it would visit.
 
 ```sh
 python3 probe.py                                    # dry run: list targets
+python3 probe.py --yes-i-know --max 3               # uses probe_proxy.json
 python3 probe.py --yes-i-know --proxy socks5://127.0.0.1:1080 --max 3
 python3 probe.py --list                             # stored results
 ```
+
+- **Proxy settings** live in `probe_proxy.json` (git-ignored, may hold credentials; copy
+  `probe_proxy.example.json`): `proxy`, `country`, `locale`, `timezone`. Command-line flags
+  override it. The per-key limit counts per proxy, so switching country probes targets again.
 
 - **Targets** come from `pinhunt.db`: one per smartlink key, per netlify tracker host, and per
   other destination URL, interleaved by domain. A target is skipped once it has been probed
   `--per-key` times (default 1). `--domain`, `--key`, `--kind` and `--url` narrow the choice.
 - **Sandbox**: the browser runs under bubblewrap with a read-only root, an empty home folder
   and `/tmp`, and only the run's output folder writable, so it can't see the project or the
-  database. It needs `--proxy` (or an explicit `--direct`).
+  database. It needs a proxy (from the settings file or `--proxy`), or an explicit `--direct`.
 - **Each visit** uses a fresh browser context with a mobile user agent and a
   `pinterest.com` referrer. Permissions are denied; downloads, service workers, popups and
   notification or push requests are blocked and logged; nothing is clicked or typed.
@@ -153,6 +158,7 @@ python3 probe.py --list                             # stored results
 | `probe.py`      | sandboxed browser probe of destinations (opt-in)                   | yes     |
 | `archive/`      | evidence folders per pin, `index.md`, and the `_pics` board        | no      |
 | `probes/`       | probe screenshots, HAR files and results                           | no      |
+| `probe_proxy.json` | probe proxy / locale / timezone (example: `probe_proxy.example.json`) | no   |
 
 Each `archive/pins/<pin_id>/` holds `summary.md`, `pin.json`, `redirect_chain.json`,
 `poster_profile.json`, `poster_boards.json`, `page.html`, `media/` and a SHA-256

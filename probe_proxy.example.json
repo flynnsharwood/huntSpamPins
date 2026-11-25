@@ -1,0 +1,7 @@
+{
+  "_comment": "Settings for probe.py. Edit freely; command-line flags override these. Keep locale/timezone consistent with the proxy's country.",
+  "proxy": "http://host:port",
+  "country": "IN",
+  "locale": "en-IN",
+  "timezone": "Asia/Kolkata"
+}
