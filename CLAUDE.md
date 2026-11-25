@@ -40,6 +40,91 @@ archive evidence before Pinterest deletes it, and report accounts/links for take
 7. When clicked directly, walkingdrunkard.com "opens and closes" - likely geo/bot/referrer
    filtering or the user's ad blocker; the redirect chain up to it works.
 
+## Findings from report of 2026-11-25 (332 pins, 41 posters, 17 domains, 104 keys)
+
+Corrections to the list above: accounts do NOT post one bait pin, and keys are NOT one per account.
+
+- **Waves**: farm accounts post 4-16 bait pins within 1-2 minutes, then another wave ~5 days later
+  (stephaniedoll 09-21 ×11 / 09-27 ×16; amanidoll 10-20 ×11 / 10-25 ×12; amirahnora 10-25 ×11 /
+  10-30 ×10). jadeclara7425 + lydaclara7425 posted waves minutes apart on 11-01 ~04:00 and 11-05
+  ~18:30 UTC → one scheduler. First bait wave 5-28 days after account creation (mostly 14-20).
+  Busiest UTC hours: 15, 18, 21.
+- **Clusters by shared smartlink key / auctionr id** (strongest attribution signal):
+  blue (sageblue, anastasiablue, evieblue `391504`) · janaam (indyjanaam, neriahjanaam) ·
+  doll (stephaniedoll, amanidoll `92473`) · clara (jadeclara, lydaclara `7425`) · nora (amirahnora).
+  No key overlap *between* these clusters → separate campaigns.
+- Name families beyond numeric suffixes: `*janaam`, `*nora`/`theanora4143`, `*clara`, `*blue`,
+  `*doll`, `neriah*`; several accounts created the same day (2026-10-24: neriah8742, ariaangel7612,
+  neriahjanaam, indyjanaam).
+- **21 aged accounts (2012-2022, thousands of pins, 1 bait pin each, 0 repins)** share keys with farm
+  pins (tessiefish↔blue, carlosochoabram/passionatedesir↔janaam, arjusiris↔amirahnora).
+  **VERIFIED 2026-11-25 (DB query): all 21 bait pins from pre-2026 accounts have is_repin=1;
+  13 have native_creator = a different (farm) account, 8 have no native_creator at all. All 299
+  bait pins from 2026 accounts are originals (is_repin=0, native_creator = pinner).**
+  They are savers (bystanders / save-everything users), NOT operators and NOT hijacked. Do not
+  report them. The report now attributes by native_creator: **33 operator accounts** (20 with their
+  own bait pins in the DB + 13 known only through savers' copies) and **21 savers**.
+- **Operators found through saved copies** (2026-11-25): the 13 native creators are classic farm
+  accounts - created 2026-07-12…10-16, 110-234 pins, 1-2 boards. They add new families
+  `*bulbul` (lillianabulbul, matidabulbul, michellebulbul19233), `*juliat58396n24` (arielle-,
+  isabela-, lyric-), `*luna` (wynterluna2526, lakelynnluna), and join known clusters:
+  aryablue → blue (shared keys), makenziejanaam → janaam, lakelynnluna → amirahnora (shared
+  auctionr id). lillianabulbul, matidabulbul, michellebulbul19233 and evienora4143 were all
+  created 2026-09-29 (across two name families). Their own bait pins are not in the DB and they
+  are not crawled yet (`expand` will now crawl them). **enzolaith5189 profile is `removed`** -
+  the first removal seen.
+- The 8 savers with no native_creator (tessiefish, carlosochoabram, prasadmantri921,
+  sandralaurent78, dhimangshu21, prosenjitmondal818, joshtreebrond, alycomm1) carry bait whose
+  original creator is unknown (original probably deleted).
+- Netlify operator lisandra_mitchell6085 posts on a schedule: after the 42-pin burst on 11-11,
+  waves of 2-5 pins every ~2-10 h, starting at :00-:05 or :30-:33 past the hour → automated poster.
+- Synchronised waves (report "Waves" section): jadeclara7425 + lydaclara7425 (11-01 03:57), and
+  berkley66600 + neriahjanaam both at 11-13 14:31 (different link schemes - may be coincidence).
+- podnova decoded offline: `twitter.podnova.com/go/?url=` → `yuiuuyttyikkoi.blogspot.com/2026/11/
+  <post>.html?utm_campaign=fair6|masti46|masti47&utm_source=google|tumblr` (not fetched).
+- Warm-up recomputed from the operator's account (savers excluded): n=263, median 16.9 days,
+  157 of 263 pins at 14-20 days, max 124.8 (kaylanicora).
+- Link ecosystems: (a) `?key=` smartlink domains with 3-word names (depthschokedirected,
+  walkingdrunkard, surelydecoratedfundraiser, effectivecpmnetwork, cursecrookadvantage, revolthem,
+  thorpejoy, turnstilesocially, industriousslowly, formssternlystately, motortape, kangaroolame);
+  (b) `auctionr.org/4/<22 hex>` - second network, mixed into the same waves;
+  (c) netlify trackers on 3 subdomains (lisandra_mitchell6085: 96 pins, 42 in 7 min;
+  abilenehahn6391o; birgitoertel4823) with shuffled path segments `kampid`, `strtjid`, `i#####`,
+  `q<pinterest search term>` → SEO-targeted at Pinterest searches;
+  (d) `twitter.podnova.com/go/` (berkley66600) - probable third-party open redirect; the
+  destination is an unencoded URL in `?url=` (decoded, see above).
+- Search saturation (corrected 2026-11-25 from the `searches` log): emoji / fancy-unicode queries
+  DO return results (18 of 39, ~6800 results) but added only 7 new pins; plain-text queries
+  (18 of 26 with results, ~7100 results) added 139. Only "Tap the image link to get the exact
+  look" was really productive (129, netlify scheme). Emoji only add cost → plain-text queries only.
+- As of 2026-11-25 no pin had been removed by Pinterest; one operator profile (enzolaith5189) is
+  gone.
+
+## Open tasks / ideas
+
+1. [x] Attribute pins by `native_creator` (fallback pinner); separate "savers" (is_repin=1) from
+   operators in report tables and exclude them from warm-up stats and from `expand` crawling.
+   Add every native_creator of a saved bait pin to `users` so it gets fetched/crawled; add a report
+   section "operators known only through saved copies" (native_creator removed or not crawlable).
+   *Done 2026-11-25: `attribute()`; saver = repin, or account ≥365 days older than its only bait
+   pin. Native creators are added to `users` by `fetch` and by a migration in `DB.__init__`.*
+2. [x] Report section: clusters = connected components of accounts sharing key / auctionr id / tinyurl /
+   image_signature / netlify host; list waves per account (pins ≤15 min apart).
+   *Done: `clusters()`, `waves()` + synchronised-wave list.*
+3. [x] Name-family batch detection (shared stem or same creation date), not only numeric suffix.
+   *Done: `name_families()` (numeric suffix, shared suffix ≥4 / prefix ≥5 letters, same creation day).*
+4. [x] `unwrap()`: decode any URL embedded in query params offline (e.g. podnova `/go/?url=`).
+   *Done: `decode_embedded()`; existing links updated offline with `resolve --reclassify`.*
+5. [x] `queries --prune` (drop queries with 0 results after ≥2 runs); `derive_queries` should add only
+   plain-text cores, no emoji variants. *Done; pruned queries stay as `# pruned` comments so
+   `--update` won't re-add them. Not run on the real queries.txt yet (dry run: 20 would go).*
+6. [x] Don't crawl huge saver accounts in `expand` (skip users with pin_count > ~5000).
+   *Done: `--max-user-pins` (default 5000); expand now crawls operators (native_creator), not pinners.*
+7. Discovery beyond search: crawl the farm boards' followers / repinners of high-repin bait pins.
+8. Convert the remaining emoji queries in queries.txt to their plain-text cores (most return
+   results, so `--prune` keeps them, but they add almost no new pins).
+9. Next network run: `profiles` + `expand` to crawl the 13 operators found via saved copies.
+
 ## Project files
 
 - `pinhunt.py` - the tool (Python stdlib only; optional `gallery-dl` for media).
@@ -53,13 +138,19 @@ archive evidence before Pinterest deletes it, and report accounts/links for take
 
 ## pinhunt.py structure
 
-Commands: `add`, `fetch [--retry-errors]`, `resolve`, `profiles`, `search [--queries F]`,
-`queries [--update --dry-run --min-count N]`, `expand`, `recheck --days N`,
-`archive [--accounts --wayback --force --pin ID]`, `report`, `status`, `clean`,
-`run [--no-discover --no-search --no-expand --no-archive --no-update-queries --rounds N]`.
+Commands: `add`, `fetch [--retry-errors]`, `resolve [--force | --reclassify]`, `profiles`,
+`search [--queries F --sample N]`, `queries [--update --prune --min-runs N --dry-run --min-count N]`,
+`expand [--sample N --max-user-pins N]`, `recheck --days N`,
+`archive [--accounts --wayback --force --pin ID]`, `report`, `pics [--no-board]`, `status`, `clean`,
+`run [--no-discover --no-search --no-expand --no-archive --no-pics --no-update-queries --rounds N
+--sample N --max-user-pins N]`.
 
 `run` = fetch → resolve → profiles → (update queries → search → fetch) → (expand → fetch) ×rounds
-→ resolve → profiles → update queries → report → archive.
+→ resolve → profiles → update queries → report → archive → pics.
+
+`resolve --reclassify` is offline: it re-decodes embedded URLs at the end of stored chains and
+recomputes `kind`/`key` (no requests). Report attribution: `operator` = native_creator (else the
+pinner unless it is a saver), `saver` flag; both are also columns in pins.csv.
 
 DB tables: `pins` (status new/ok/removed/error/invalid, bait flag, raw JSON, archived_at,
 archive_dir), `links` (chain, final_domain, key, kind), `users` (profile, crawled, archived_at),

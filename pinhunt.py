@@ -221,17 +221,41 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _opener = urllib.request.build_opener(_NoRedirect)
 
 
+URL_PARAMS = ("url", "q", "u", "link", "target", "dest", "destination", "redirect", "redirect_url",
+              "redir", "goto", "to", "r", "out", "next", "continue")
+
+
+def decode_embedded(url):
+    """If `url` carries another http(s) URL in a query parameter (google.com/url?q=,
+    podnova /go/?url=, ...), return that URL. Pure string work - nothing is requested.
+    Unencoded embedded URLs (`?url=https://x/?a=1&b=2`) keep the rest of the query string."""
+    p = urllib.parse.urlparse(url)
+    if not p.query:
+        return None
+    for name in URL_PARAMS:
+        m = re.search(r"(?:^|&)" + re.escape(name) + r"=([^&]*)", p.query, re.I)
+        if not m:
+            continue
+        raw = m.group(1)
+        google = p.netloc.lower() in ("google.com", "www.google.com")
+        if re.match(r"https?://", raw, re.I) and not google:   # not encoded: take everything after it
+            val = p.query[m.start(1):]
+        else:
+            val = urllib.parse.unquote_plus(raw)
+        if re.match(r"https?://[^/\s]+", val, re.I) and val != url:
+            return val
+    return None
+
+
 def unwrap(link):
-    """Follow shorteners / decode google.com/url. Never requests the final destination."""
+    """Follow shorteners / decode google.com/url and other embedded-URL redirects offline.
+    Never requests the final destination: only hosts in REDIRECTORS are ever contacted."""
     chain, url, err = [link], link, None
     for _ in range(10):
         p = urllib.parse.urlparse(url)
         host = p.netloc.lower()
-        if host in ("google.com", "www.google.com") and p.path == "/url":
-            qs = urllib.parse.parse_qs(p.query)
-            nxt = (qs.get("q") or qs.get("url") or [None])[0]
-            if not nxt:
-                break
+        nxt = decode_embedded(url) if host not in REDIRECTORS else None
+        if nxt:
             url = nxt; chain.append(url + "  [decoded offline]"); continue
         if host not in REDIRECTORS:
             break
@@ -270,6 +294,10 @@ def classify(link, chain, final):
         kind = "smartlink (?key=)"
     elif host.endswith("netlify.app"):
         kind = "netlify tracker page"
+    elif host.endswith("auctionr.org") and re.match(r"/\d+/[0-9a-f]{16,}", fp.path):
+        kind = "auctionr /<n>/<id>"
+    elif via_google and lhost not in ("google.com", "www.google.com") and "tinyurl" not in lhost:
+        kind = f"redirect via {lhost} > {host}"
     elif host in REDIRECTORS:
         kind = "shortener (unresolved)"
     else:
@@ -289,6 +317,10 @@ class DB:
         except sqlite3.OperationalError:
             pass
         self.c.executescript(SCHEMA)
+        # original creators of repins are users too (older DBs only stored the repinner)
+        self.c.execute("""INSERT OR IGNORE INTO users(username, first_seen)
+                          SELECT DISTINCT native_creator, datetime('now') FROM pins
+                          WHERE native_creator IS NOT NULL AND native_creator<>''""")
         for table, col, typ in (("pins", "archived_at", "TEXT"), ("pins", "archive_dir", "TEXT"),
                                 ("users", "archived_at", "TEXT"),
                                 # expand results: when, related items returned (NULL = request failed),
@@ -391,12 +423,39 @@ def step_fetch(db, api, ids=None):
              d.get("image_signature"), int(pid) >> 46, int(looks_bait(title, desc, link, bname)),
              json.dumps(d)[:200000], pid)
         db.add_user(pinner)
+        db.add_user(uname(d.get("native_creator")))   # original creator of a repin = likely operator
         db.add_link(link)
         if board.get("id"):
             db.add_board(board.get("url") or board["id"], board_id=board["id"], url=board.get("url"),
                          owner=pinner, name=bname, created_at=iso(board.get("created_at")))
         log(f"  {n}/{len(rows)} {pid}: {pinner} | {title[:45]!r} | {link[:50]}")
         db.commit()
+
+
+def step_reclassify(db):
+    """Offline: decode embedded URLs at the end of already-resolved chains and recompute kind/key.
+    No network requests (a decoded shortener is left for the next normal `resolve`)."""
+    rows = db.q("SELECT link, chain FROM links WHERE resolved_at IS NOT NULL")
+    changed = 0
+    for r in rows:
+        chain = json.loads(r["chain"] or "[]") or [r["link"]]
+        final = chain[-1].replace("  [decoded offline]", "")
+        while True:
+            nxt = decode_embedded(final)
+            if not nxt or urllib.parse.urlparse(final).netloc.lower() in REDIRECTORS:
+                break
+            final = nxt; chain.append(nxt + "  [decoded offline]")
+        host, path, key, kind = classify(r["link"], chain, final)
+        cur = db.q("SELECT final_url, kind FROM links WHERE link=?", r["link"])[0]
+        if (cur["final_url"], cur["kind"]) != (final, kind):
+            changed += 1
+            log(f"  {r['link'][:50]} -> {host}{path[:30]} [{kind}]")
+        resolved = urllib.parse.urlparse(final).netloc.lower() not in REDIRECTORS
+        db.x("""UPDATE links SET final_url=?, final_domain=?, path=?, key=?, chain=?, kind=?,
+                resolved_at=CASE WHEN ? THEN resolved_at ELSE NULL END WHERE link=?""",
+             final, host, path, key, json.dumps(chain), kind, int(resolved), r["link"])
+    db.commit()
+    log(f"[resolve] reclassified {len(rows)} links offline, {changed} changed")
 
 
 def step_resolve(db, force=False):
@@ -480,7 +539,7 @@ def step_search(db, api, queries, max_pages, sample=0):
         log(f"  {q!r}: {page} pages, {total_new} new candidate pins")
 
 
-def step_expand(db, api, max_related, max_pages, sample=0):
+def step_expand(db, api, max_related, max_pages, sample=0, max_user_pins=5000):
     # 1. related pins of bait pins that have a link
     all_rows = db.q("""SELECT pin_id FROM pins WHERE status='ok' AND bait=1 AND link<>'' AND expanded=0
                        ORDER BY first_seen""")
@@ -508,8 +567,15 @@ def step_expand(db, api, max_related, max_pages, sample=0):
                                      f" of {seen} related" if seen else " (no related pins)"))
 
     # 2. boards + created pins of every poster of a bait pin
-    all_users = db.q("""SELECT DISTINCT u.username FROM users u JOIN pins p ON p.pinner=u.username
-                        WHERE p.bait=1 AND u.crawled=0 AND u.status<>'removed'""")
+    # accounts that created bait (native_creator, else pinner); savers' huge accounts are skipped
+    all_users = db.q("""SELECT DISTINCT u.username FROM users u
+                        JOIN pins p ON u.username = COALESCE(NULLIF(p.native_creator, ''), p.pinner)
+                        WHERE p.bait=1 AND u.crawled=0 AND u.status<>'removed'
+                        AND (? <= 0 OR u.pin_count IS NULL OR u.pin_count <= ?)""", max_user_pins, max_user_pins)
+    big = db.q("""SELECT COUNT(DISTINCT u.username) n FROM users u JOIN pins p ON p.pinner=u.username
+                  WHERE p.bait=1 AND u.crawled=0 AND ? > 0 AND u.pin_count > ?""", max_user_pins, max_user_pins)[0]["n"]
+    if big:
+        log(f"[expand] skipping {big} uncrawled accounts with more than {max_user_pins} pins (likely savers)")
     users = pick(all_users, sample)
     log(f"[expand] crawling {_picked(len(all_users), users)} poster accounts")
     for r in users:
@@ -598,6 +664,12 @@ def load_queries(path):
     return uniq
 
 
+def _plain_core(t):
+    """Text without emoji / symbols / fancy unicode: only plain words, digits, + ' -."""
+    t = unicodedata.normalize("NFKC", t)   # 𝐇𝐎𝐓 -> HOT
+    return re.sub(r"\s+", " ", re.sub(r"[^A-Za-z0-9\s+'’-]", " ", t)).strip(" -")
+
+
 def derive_queries(db):
     """Candidate search phrases from bait pins: Counter(query -> number of supporting pins)."""
     rows = db.q("SELECT title, board_name, description FROM pins WHERE status='ok' AND bait=1")
@@ -609,28 +681,59 @@ def derive_queries(db):
         # a title is used if it looks like bait, or is a repeated template (>=2 bait pins share it)
         if (t and not t.lower().startswith("pin on ") and 4 <= len(t) <= 100
                 and (BAIT_RE.search(t) or title_counts[t] >= 2)):
-            cands.add(t)
-            if "▶️" in t:
-                cands.add(t.replace("▶️", "▶"))
-            elif "▶" in t:
-                cands.add(t.replace("▶", "▶️"))
-            core = re.sub(r"\s+", " ", re.sub(r"[^\w\s+'’-]", " ", t)).strip()
-            if len(core.split()) >= 2 and _qnorm(core) != _qnorm(t):
-                cands.add(core)
+            cands.add(_plain_core(t))
         b = (r["board_name"] or "").strip()
         if b and BAIT_RE.search(b) and len(b) <= 80:
-            cands.add(b)
+            cands.add(_plain_core(b))
         for piece in re.split(r"[.!?\n]+", r["description"] or ""):
             piece = piece.strip(" -–—")
             if BAIT_RE.search(piece) and 3 <= len(piece.split()) <= 12:
-                cands.add(piece)
+                cands.add(_plain_core(piece))
         for c in cands:
-            cnt[c] += 1
+            if c and len(c.split()) >= 2:   # Pinterest search returns nothing for emoji queries
+                cnt[c] += 1
     return cnt
 
 
+def _pruned_queries(path):
+    """Queries removed by `queries --prune` (kept as '# pruned: <q>' so --update won't re-add them)."""
+    if not os.path.exists(path):
+        return set()
+    with open(path, encoding="utf-8") as f:
+        return {_qnorm(l.split(":", 1)[1]) for l in f if l.startswith("# pruned")}
+
+
+def prune_queries(db, path, dry_run=False, min_runs=2):
+    """Comment out queries that returned 0 results in every one of >= min_runs runs."""
+    stats = {_qnorm(r["query"]): r for r in db.q(
+        """SELECT query, COUNT(DISTINCT substr(run_at,1,16)) runs, SUM(results) results
+           FROM searches GROUP BY query""")}
+    load_queries(path)   # creates the file if missing
+    with open(path, encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    out, dropped = [], []
+    for line in lines:
+        q = line.strip()
+        st = stats.get(_qnorm(q)) if q and not q.startswith("#") else None
+        if st and st["runs"] >= min_runs and not st["results"]:
+            dropped.append(q); out.append(f"# pruned {now()[:10]} (0 results in {st['runs']} runs): {q}")
+        else:
+            out.append(line)
+    for q in dropped:
+        log(f"  - {q!r}")
+    if not dropped:
+        log(f"[queries] nothing to prune (no query with 0 results over >= {min_runs} runs)")
+    elif dry_run:
+        log(f"[queries] dry run: {len(dropped)} queries would be pruned from {path}")
+    else:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(out) + "\n")
+        log(f"[queries] pruned {len(dropped)} queries from {path} (kept as '# pruned' comments)")
+    return dropped
+
+
 def update_queries(db, path, dry_run=False, min_count=1):
-    existing = {_qnorm(q) for q in load_queries(path)}
+    existing = {_qnorm(q) for q in load_queries(path)} | _pruned_queries(path)
     new = [(q, n) for q, n in derive_queries(db).most_common()
            if n >= min_count and _qnorm(q) not in existing]
     if not new:
@@ -941,13 +1044,127 @@ def md_table(headers, rows, align=""):
 
 
 # ----------------------------------------------------------------- report
-def batches(usernames):
-    by = collections.defaultdict(set)
-    for u in usernames:
-        m = re.match(r"^([A-Za-z_.]+?)[_.-]?(\d{4,})$", u or "")
+AGED_DAYS = 365      # pinner account this much older than the bait pin, with 1 bait pin -> saver
+WAVE_GAP_MIN = 15    # bait pins of one account at most this far apart belong to one wave
+
+
+def attribute(rows, users):
+    """Who is behind each pin. Sets r['saver'] = 1 if the pinner only carried someone else's bait
+    (a repin, or an aged account with a single bait pin), r['operator'] = the account that created
+    the bait (native_creator, else the pinner unless it is a saver; None = unknown), and
+    r['warmup_days'] from the operator's account creation (None for savers' copies)."""
+    n_bait = collections.Counter(r["pinner"] for r in rows if r["status"] == "ok" and r["bait"])
+    for r in rows:
+        nc, pinner = r.get("native_creator") or "", r.get("pinner")
+        b = parse_iso(r.get("created_at") or "")
+        a = parse_iso((users.get(pinner) or {}).get("created_at") or "")
+        aged = bool(a and b and (b - a).days >= AGED_DAYS)
+        repin = bool(r.get("is_repin")) or bool(nc and nc != pinner)
+        r["saver"] = int(repin or (aged and n_bait[pinner] == 1))
+        r["operator"] = nc if nc and nc != pinner else (None if r["saver"] else pinner)
+        op = users.get(r["operator"]) or {}
+        r["op_created"] = op.get("created_at")
+        c = parse_iso(op.get("created_at") or "")
+        r["warmup_days"] = round((b - c).total_seconds() / 86400, 1) if c and b and not r["saver"] else None
+
+
+def link_attrs(r):
+    """Shared-infrastructure signals of a pin, used to join accounts into clusters."""
+    out = []
+    if r.get("key"):
+        out.append(("key", r["key"]))
+    if (r.get("kind") or "").startswith("auctionr"):
+        out.append(("auctionr id", r["path"]))
+    if "tinyurl" in urllib.parse.urlparse(r.get("link") or "").netloc.lower():
+        out.append(("tinyurl", r["link"]))
+    if (r.get("final_domain") or "").endswith("netlify.app"):
+        out.append(("netlify host", r["final_domain"]))
+    if r.get("image_signature"):
+        out.append(("image", r["image_signature"]))
+    return out
+
+
+def clusters(pins):
+    """Connected components of operator accounts that share a key / auctionr id / tinyurl /
+    netlify host / image. Returns [(accounts, {signal type: number of shared values})]."""
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]; x = parent[x]
+        return x
+    users_of = collections.defaultdict(set)
+    for r in pins:
+        if not r.get("operator"):
+            continue
+        a = ("acct", r["operator"]); find(a)
+        for at in link_attrs(r):
+            parent[find(a)] = find(at); users_of[at].add(r["operator"])
+    comps = collections.defaultdict(set)
+    for x in list(parent):
+        if x[0] == "acct":
+            comps[find(x)].add(x[1])
+    out = []
+    for root, accts in comps.items():
+        shared = collections.Counter(at[0] for at, us in users_of.items() if len(us) > 1 and find(at) == root)
+        out.append((sorted(accts), dict(shared)))
+    return sorted(out, key=lambda c: (-len(c[0]), c[0]))
+
+
+def waves(pins, gap_min=WAVE_GAP_MIN):
+    """Bursts of bait pins per operator: consecutive pins at most gap_min minutes apart.
+    Savers' copies are left out (their time is when they saved it, not when it was posted)."""
+    by = collections.defaultdict(list)
+    for r in pins:
+        d = parse_iso(r.get("created_at") or "")
+        if r.get("operator") and not r.get("saver") and d:
+            by[r["operator"]].append((d, r))
+    out = []
+    for acct, lst in by.items():
+        lst.sort(key=lambda x: x[0])
+        cur = [lst[0]]
+        for prev, nxt in zip(lst, lst[1:]):
+            if (nxt[0] - prev[0]).total_seconds() > gap_min * 60:
+                out.append((acct, cur)); cur = []
+            cur.append(nxt)
+        out.append((acct, cur))
+    return sorted(out, key=lambda w: (w[0], w[1][0][0]))
+
+
+def name_families(accounts, created):
+    """Groups of accounts that look batch-made: same numeric suffix, shared name stem
+    (e.g. *blue, *janaam, neriah*), or created on the same day. Returns [(signal, label, members)]."""
+    fams = {}
+
+    def add(signal, label, members):
+        if len(members) > 1:
+            fams.setdefault((signal, frozenset(members)), label)
+    by_num, by_day = collections.defaultdict(set), collections.defaultdict(set)
+    for u in accounts:
+        m = re.match(r"^([A-Za-z_.]+?)[_.-]?(\d{4,})$", u)
         if m:
-            by[m.group(2)].add(u)
-    return {k: sorted(v) for k, v in by.items() if len(v) > 1}
+            by_num[m.group(2)].add(u)
+        if (created.get(u) or "")[:10]:
+            by_day[created[u][:10]].add(u)
+    for k, v in by_num.items():
+        add("numeric suffix", k, v)
+    letters = {u: re.match(r"[a-z]*", u.lower()).group(0) for u in accounts}
+    for u, w in letters.items():
+        # shortest suffix (>= 4 letters, after a first-name head) / prefix (>= 5) shared with another account
+        for L in range(4, len(w)):
+            g = {v for v, x in letters.items() if len(x) > L and x.endswith(w[-L:])}
+            if len(g) > 1:
+                add("name stem", "*" + os.path.commonprefix([letters[v][::-1] for v in g])[::-1], g); break
+        for L in range(5, len(w) + 1):
+            g = {v for v, x in letters.items() if x.startswith(w[:L])}
+            if len(g) > 1:
+                add("name stem", os.path.commonprefix([letters[v] for v in g]) + "*", g); break
+    for k, v in by_day.items():
+        add("created same day", k, v)
+    order = {"numeric suffix": 0, "name stem": 1, "created same day": 2}
+    return sorted(((sig, lab, sorted(m)) for (sig, m), lab in fams.items()),
+                  key=lambda f: (order[f[0]], -len(f[2]), f[1]))
 
 
 def report(db, out_md="report.md", out_csv="pins.csv", since=None):
@@ -958,12 +1175,11 @@ def report(db, out_md="report.md", out_csv="pins.csv", since=None):
                    FROM pins p LEFT JOIN links l ON l.link=p.link
                    LEFT JOIN users u ON u.username=p.pinner""")
     rows = [dict(r) for r in rows]
-    for r in rows:
-        a, b = parse_iso(r.get("acct_created") or ""), parse_iso(r.get("created_at") or "")
-        r["warmup_days"] = round((b - a).total_seconds() / 86400, 1) if a and b else None
+    users = {u["username"]: dict(u) for u in db.q("SELECT * FROM users")}
+    attribute(rows, users)
 
     cols = ["pin_id", "status", "source", "first_seen", "created_at", "pinner", "full_name",
-            "native_creator", "is_repin", "board_name", "title", "description", "repin_count", "link",
+            "native_creator", "is_repin", "operator", "saver", "op_created", "board_name", "title", "description", "repin_count", "link",
             "final_url", "final_domain", "key", "kind", "link_error", "acct_created", "acct_pins",
             "acct_boards", "acct_followers", "acct_status", "warmup_days", "shard", "image_signature"]
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
@@ -980,7 +1196,10 @@ def report(db, out_md="report.md", out_csv="pins.csv", since=None):
     P("## Totals\n")
     P(f"- Pins in database: **{len(rows)}** ({', '.join(f'{k}: {v}' for k, v in st.items())})")
     P(f"- Bait pins: **{len(bait)}**, with outbound link: **{len(linked)}**")
-    P(f"- Distinct posters of bait pins: **{len({r['pinner'] for r in bait if r['pinner']})}**")
+    ops = {r["operator"] for r in bait if r["operator"]}
+    savers = {r["pinner"] for r in bait if r["saver"]}
+    P(f"- Distinct posters of bait pins: **{len({r['pinner'] for r in bait if r['pinner']})}** — "
+      f"operator accounts (created the bait): **{len(ops)}**, savers (repinned / carried it): **{len(savers)}**")
     P(f"- Distinct outbound links: **{len({r['link'] for r in linked})}**, "
       f"final domains: **{len({r['final_domain'] for r in linked if r['final_domain']})}**, "
       f"smartlink keys: **{len({r['key'] for r in linked if r['key']})}**")
@@ -998,9 +1217,9 @@ def report(db, out_md="report.md", out_csv="pins.csv", since=None):
         by_dom[r["final_domain"] or "(unresolved)"].append(r)
     for dom, rs in sorted(by_dom.items(), key=lambda kv: -len(kv[1])):
         dates = sorted(r["created_at"] for r in rs if r["created_at"])
-        T.append([dom, len(rs), len({r['key'] for r in rs if r['key']}), len({r['pinner'] for r in rs}),
-                  dates[0][:10] if dates else '', dates[-1][:10] if dates else ''])
-    P(md_table(["domain", "pins", "keys", "posters", "first pin", "last pin"], T, "lrrrll"))
+        T.append([dom, len(rs), len({r['key'] for r in rs if r['key']}), len({r['operator'] for r in rs if r['operator']}),
+                  sum(r['saver'] for r in rs), dates[0][:10] if dates else '', dates[-1][:10] if dates else ''])
+    P(md_table(["domain", "pins", "keys", "operators", "via savers", "first pin", "last pin"], T, "lrrrrll"))
 
     P("\n## Domain timeline (bait pins per ISO week)\n")
     weeks = collections.defaultdict(collections.Counter)
@@ -1015,16 +1234,60 @@ def report(db, out_md="report.md", out_csv="pins.csv", since=None):
     P(md_table(["count", "title"], [[n, f"`{k}`"] for k, n in
                                      collections.Counter(r["title"] for r in bait).most_common(25)], "rl"))
 
-    P("\n## Account batches (usernames sharing a numeric suffix)\n")
-    bt = batches({r["pinner"] for r in bait if r["pinner"]})
-    if bt:
-        for suf, us in sorted(bt.items(), key=lambda kv: -len(kv[1])):
-            doms = {r["final_domain"] for r in linked if r["pinner"] in us and r["final_domain"]}
-            P(f"- **{suf}**: {', '.join(us)}  → {', '.join(sorted(doms)) or 'no links'}")
+    def doms_of(accts):
+        return ', '.join(sorted({r['final_domain'] for r in linked if r['operator'] in accts and r['final_domain']}))
+
+    P("\n## Account families (operators only; heuristic)\n")
+    created = {u: (users.get(u) or {}).get("created_at") for u in ops}
+    fam = name_families(sorted(ops), created)
+    if fam:
+        P(md_table(["signal", "family", "n", "accounts", "domains"],
+                   [[sig, f"`{lab}`", len(m), ', '.join(m), doms_of(m)] for sig, lab, m in fam], "llrll"))
     else:
         P("- none found yet")
+    unprofiled = sorted(u for u in ops if not created.get(u))
+    if unprofiled:
+        P(f"\n{len(unprofiled)} operator accounts have no profile yet (run `profiles`): {', '.join(unprofiled)}")
 
-    P("\n## Warm-up (days from account creation to bait pin)\n")
+    P("\n## Clusters (operators sharing a key, auctionr id, tinyurl, netlify host or image)\n")
+    cl = clusters(bait)
+    multi = [c for c in cl if len(c[0]) > 1]
+    if multi:
+        P(md_table(["#", "accounts", "n", "bait pins", "shared signals", "domains", "first pin", "last pin"],
+                   [[i, ', '.join(a), len(a), sum(1 for r in bait if r['operator'] in a),
+                     ', '.join(f"{k} ×{v}" for k, v in sorted(sh.items())),
+                     doms_of(set(a)),
+                     min((r['created_at'] or '' for r in bait if r['operator'] in a), default='')[:10],
+                     max((r['created_at'] or '' for r in bait if r['operator'] in a), default='')[:10]]
+                    for i, (a, sh) in enumerate(multi, 1)], "rlrrllll"))
+    P(f"\n{len(cl) - len(multi)} operator accounts share no signal with any other account: "
+      + ', '.join(a[0] for a, _ in cl if len(a) == 1))
+
+    P(f"\n## Waves (an operator's bait pins at most {WAVE_GAP_MIN} min apart; savers' copies excluded)\n")
+    wv = waves(bait)
+    big = [w for w in wv if len(w[1]) > 1]
+    T, last = [], {}
+    for acct, ws in wv:
+        start = ws[0][0]
+        gap = round((start - last[acct]).total_seconds() / 86400, 1) if acct in last else ''
+        last[acct] = ws[-1][0]
+        if len(ws) > 1:
+            T.append([acct, start.strftime("%Y-%m-%d %H:%M"), len(ws),
+                      round((ws[-1][0] - start).total_seconds() / 60, 1), gap,
+                      ', '.join(sorted({r['final_domain'] for _, r in ws if r['final_domain']}))])
+    if T:
+        P(md_table(["account", "start (UTC)", "pins", "minutes", "days since prev.", "domains"], T, "llrrrl"))
+    P(f"\n{len(big)} waves of 2+ pins, {len(wv) - len(big)} single pins.")
+    sync = []
+    for i, (a1, w1) in enumerate(big):
+        for a2, w2 in big[i + 1:]:
+            if a1 != a2 and abs((w1[0][0] - w2[0][0]).total_seconds()) <= WAVE_GAP_MIN * 60:
+                sync.append(f"{a1} + {a2} at {min(w1[0][0], w2[0][0]).strftime('%Y-%m-%d %H:%M')}")
+    if sync:
+        P("\nWaves of different accounts starting within the same window (one scheduler?):\n")
+        P("\n".join(f"- {x}" for x in sorted(sync, key=lambda x: x.split(' at ')[1])))
+
+    P("\n## Warm-up (days from operator account creation to bait pin; savers excluded)\n")
     gaps = sorted(r["warmup_days"] for r in linked if r["warmup_days"] is not None)
     if gaps:
         hist = collections.Counter(int(g // 7) for g in gaps)
@@ -1034,24 +1297,59 @@ def report(db, out_md="report.md", out_csv="pins.csv", since=None):
     else:
         P("- no data yet")
 
-    P("\n## Poster accounts\n")
+    P("\n## Operator accounts (created bait pins)\n")
     T = []
     acc = collections.defaultdict(list)
     for r in bait:
-        acc[r["pinner"]].append(r)
-    for u, rs in sorted(acc.items(), key=lambda kv: kv[1][0]["acct_created"] or ""):
-        r0 = rs[0]
-        T.append([u, (r0['acct_created'] or '')[:10], r0['acct_pins'], r0['acct_boards'], r0['acct_followers'],
-                  r0['acct_status'], len(rs), ', '.join(sorted({r['final_domain'] for r in rs if r['final_domain']}))])
-    P(md_table(["account", "created", "pins", "boards", "followers", "status", "bait pins", "domains"], T,
-               "llrrrlrl"))
+        if r["operator"]:
+            acc[r["operator"]].append(r)
+    for u, rs in sorted(acc.items(), key=lambda kv: (users.get(kv[0]) or {}).get("created_at") or "~"):
+        x = users.get(u) or {}
+        T.append([u, (x.get('created_at') or '')[:10], x.get('pin_count'), x.get('board_count'),
+                  x.get('follower_count'), x.get('status'), sum(not r['saver'] for r in rs),
+                  sum(r['saver'] for r in rs), ', '.join(sorted({r['final_domain'] for r in rs if r['final_domain']}))])
+    P(md_table(["account", "created", "pins", "boards", "followers", "status", "own bait pins",
+                "via savers", "domains"], T, "llrrrlrrl"))
+
+    only = sorted(u for u, rs in acc.items() if not any(not r["saver"] for r in rs))
+    P("\n## Operators known only through saved copies\n")
+    if only:
+        P("Their own bait pins are not in the database (removed, or not crawled yet) - only savers' "
+          "repins point to them.\n")
+        T = []
+        for u in only:
+            x = users.get(u) or {}
+            st = x.get("status") or "?"
+            T.append([u, (x.get("created_at") or "")[:10], x.get("pin_count"),
+                      st + (" (not profiled yet)" if st == "new" else ""),
+                      "yes" if x.get("crawled") else "no", len(acc[u]),
+                      ', '.join(sorted({r['pinner'] for r in acc[u]})),
+                      ', '.join(sorted({r['final_domain'] for r in acc[u] if r['final_domain']}))])
+        P(md_table(["account", "created", "pins", "status", "crawled", "saved copies", "saved by", "domains"],
+                   T, "llrlrrll"))
+    else:
+        P("- none")
+
+    P(f"\n## Savers (repinned or carried someone else's bait; aged = account ≥ {AGED_DAYS} days older "
+      "than the pin with 1 bait pin)\n")
+    T = []
+    sv = collections.defaultdict(list)
+    for r in bait:
+        if r["saver"]:
+            sv[r["pinner"]].append(r)
+    for u, rs in sorted(sv.items(), key=lambda kv: (users.get(kv[0]) or {}).get("created_at") or "~"):
+        x = users.get(u) or {}
+        T.append([u, (x.get('created_at') or '')[:10], x.get('pin_count'), len(rs),
+                  ', '.join(sorted({r['operator'] for r in rs if r['operator']})) or '(unknown)',
+                  ', '.join(sorted({r['final_domain'] for r in rs if r['final_domain']}))])
+    P(md_table(["account", "created", "pins", "bait pins carried", "original creator", "domains"], T, "llrrll"))
 
     P("\n## Bait pins with links (newest first)\n")
-    P(md_table(["created", "pin", "poster", "warm-up", "repins", "destination", "key"],
+    P(md_table(["created", "pin", "operator", "saved by", "warm-up", "repins", "destination", "key"],
                [[(r['created_at'] or '')[:16], f"[{r['pin_id']}](https://www.pinterest.com/pin/{r['pin_id']}/)",
-                 r['pinner'], r['warmup_days'], r['repin_count'],
+                 r['operator'] or '?', r['pinner'] if r['saver'] else '', r['warmup_days'], r['repin_count'],
                  f"{r['final_domain'] or ''}{(r['path'] or '')[:25]}", (r['key'] or '')[:10]]
-                for r in sorted(linked, key=lambda r: r["created_at"] or "", reverse=True)[:300]], "lllrrll"))
+                for r in sorted(linked, key=lambda r: r["created_at"] or "", reverse=True)[:300]], "llllrrll"))
 
     nolink = [r for r in bait if not r["link"]]
     if nolink:
@@ -1094,6 +1392,8 @@ def main():
     a = sp.add_parser("add"); a.add_argument("items", nargs="+", help="pin/board URLs, IDs, or files")
     f = sp.add_parser("fetch"); f.add_argument("--retry-errors", action="store_true")
     r = sp.add_parser("resolve"); r.add_argument("--force", action="store_true")
+    r.add_argument("--reclassify", action="store_true",
+                   help="offline only: re-decode embedded URLs and recompute link kinds of resolved links")
     pr = sp.add_parser("profiles"); pr.add_argument("--force", action="store_true")
     s = sp.add_parser("search"); s.add_argument("--query", action="append", default=[])
     s.add_argument("--queries", default="queries.txt", help="queries file (default: queries.txt)")
@@ -1101,13 +1401,17 @@ def main():
     qp = sp.add_parser("queries", help="list the queries file, or --update it from bait pins in the db")
     qp.add_argument("--queries", default="queries.txt")
     qp.add_argument("--update", action="store_true", help="append phrases learned from bait pins")
-    qp.add_argument("--dry-run", action="store_true", help="with --update: only show what would be added")
+    qp.add_argument("--prune", action="store_true", help="comment out queries with 0 results over >= --min-runs runs")
+    qp.add_argument("--min-runs", type=int, default=2)
+    qp.add_argument("--dry-run", action="store_true", help="with --update/--prune: only show what would change")
     qp.add_argument("--min-count", type=int, default=1, help="only phrases seen on at least N bait pins")
     s.add_argument("--max-pages", type=int, default=6)
     s.add_argument("--sample", type=int, default=5, help="random items per list each step: search queries, and each expand list (0 = all; default %(default)s)")
     e = sp.add_parser("expand"); e.add_argument("--max-related", type=int, default=40)
     e.add_argument("--max-pages", type=int, default=6)
     e.add_argument("--sample", type=int, default=5, help="random items per list each step: search queries, and each expand list (0 = all; default %(default)s)")
+    e.add_argument("--max-user-pins", type=int, default=5000,
+                    help="expand: skip accounts with more pins than this (0 = no limit; default %(default)s)")
     rc = sp.add_parser("recheck"); rc.add_argument("--days", type=float, default=3)
     ar = sp.add_parser("archive", help="save evidence folders for bait pins")
     ar.add_argument("--dir", default="archive")
@@ -1130,6 +1434,8 @@ def main():
     ru.add_argument("--max-pages", type=int, default=6)
     ru.add_argument("--max-related", type=int, default=40)
     ru.add_argument("--sample", type=int, default=5, help="random items per list each step: search queries, and each expand list (0 = all; default %(default)s)")
+    ru.add_argument("--max-user-pins", type=int, default=5000,
+                    help="expand: skip accounts with more pins than this (0 = no limit; default %(default)s)")
     ru.add_argument("--query", action="append", default=[])
     ru.add_argument("--queries", default="queries.txt", help="queries file (default: queries.txt)")
     ru.add_argument("--no-update-queries", action="store_true",
@@ -1156,7 +1462,7 @@ def main():
             db.x("UPDATE pins SET status='new' WHERE status='error'"); db.commit()
         step_fetch(db, api)
     elif args.cmd == "resolve":
-        step_resolve(db, args.force)
+        step_reclassify(db) if args.reclassify else step_resolve(db, args.force)
     elif args.cmd == "profiles":
         step_profiles(db, api, args.force)
     elif args.cmd == "search":
@@ -1164,9 +1470,11 @@ def main():
         log(f"[search] using {'--query only' if args.only else args.queries}")
         step_search(db, api, list(dict.fromkeys(qs)), args.max_pages, args.sample)
     elif args.cmd == "queries":
+        if args.prune:
+            prune_queries(db, args.queries, args.dry_run, args.min_runs)
         if args.update:
             update_queries(db, args.queries, args.dry_run, args.min_count)
-        else:
+        elif not args.prune:
             stats = {r["query"]: r for r in db.q(
                 "SELECT query, COUNT(*) pages, SUM(bait_hits) hits, MAX(run_at) last FROM searches GROUP BY query")}
             qs = load_queries(args.queries)
@@ -1174,11 +1482,12 @@ def main():
             for q in qs:
                 s_ = stats.get(q)
                 log(f"  {q!r}" + (f"   [new pins: {s_['hits']}, last run {s_['last'][:16]}]" if s_ else "   [never run]"))
-            pending = [q for q, n in derive_queries(db).items() if _qnorm(q) not in {_qnorm(x) for x in qs}]
+            known = {_qnorm(x) for x in qs} | _pruned_queries(args.queries)
+            pending = [q for q in derive_queries(db) if _qnorm(q) not in known]
             if pending:
                 log(f"\n{len(pending)} new phrases could be learned from the db - run `queries --update`")
     elif args.cmd == "expand":
-        step_expand(db, api, args.max_related, args.max_pages, args.sample)
+        step_expand(db, api, args.max_related, args.max_pages, args.sample, args.max_user_pins)
     elif args.cmd == "recheck":
         cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=args.days)).isoformat()
         ids = [r["pin_id"] for r in db.q("SELECT pin_id FROM pins WHERE status IN ('ok','error') "
@@ -1228,7 +1537,7 @@ def main():
             for i in range(args.rounds):
                 log(f"===== expand round {i+1}/{args.rounds} =====")
                 before = db.q("SELECT COUNT(*) n FROM pins")[0]["n"]
-                step_expand(db, api, args.max_related, args.max_pages, args.sample)
+                step_expand(db, api, args.max_related, args.max_pages, args.sample, args.max_user_pins)
                 step_fetch(db, api)
                 if db.q("SELECT COUNT(*) n FROM pins")[0]["n"] == before:
                     log("  nothing new; stopping expansion"); break
