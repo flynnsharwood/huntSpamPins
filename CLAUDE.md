@@ -70,8 +70,8 @@ Corrections to the list above: accounts do NOT post one bait pin, and keys are N
   isabela-, lyric-), `*luna` (wynterluna2526, lakelynnluna), and join known clusters:
   aryablue → blue (shared keys), makenziejanaam → janaam, lakelynnluna → amirahnora (shared
   auctionr id). lillianabulbul, matidabulbul, michellebulbul19233 and evienora4143 were all
-  created 2026-09-29 (across two name families). Their own bait pins are not in the DB and they
-  are not crawled yet (`expand` will now crawl them). **enzolaith5189 profile is `removed`** -
+  created 2026-09-29 (across two name families). *(Since crawled - see the 821-pin section below;
+  12 of 13 now have their own bait pins in the DB.)* **enzolaith5189 profile is `removed`** -
   the first removal seen.
 - The 8 savers with no native_creator (tessiefish, carlosochoabram, prasadmantri921,
   sandralaurent78, dhimangshu21, prosenjitmondal818, joshtreebrond, alycomm1) carry bait whose
@@ -100,6 +100,45 @@ Corrections to the list above: accounts do NOT post one bait pin, and keys are N
 - As of 2026-11-25 no pin had been removed by Pinterest; one operator profile (enzolaith5189) is
   gone.
 
+## Findings after expand of the 18 uncrawled operators (2026-11-25, 821 pins, 53 posters, 17 domains, 220 keys)
+
+- `expand --sample 18` crawled all 18 uncrawled operators: +488 pins (abilenehahn6391o 124,
+  birgitoertel4823 100, others 5-37 each). Related pins and boards added **0** new pins → the
+  operators' own created-pins feeds are where new bait comes from, not related-pins.
+- Totals now 808 bait pins (772 with link), 595 links, still **17 final domains** (no new domains),
+  220 keys, 33 operators + 21 savers (unchanged - no new accounts, only more pins per account).
+  113 waves of ≥2 pins. Warm-up n=751, median 18.9 days, 397 of 751 at 14-20 days.
+- Of the 13 operators known only through saved copies, 12 now have their own bait pins in the DB;
+  only **enzolaith5189 (removed)** remains known only via a saver (finanzalex, formssternlystately.com).
+- **Clusters (shared key / auctionr id / tinyurl / netlify host / image), 8 multi-account:**
+  janaam+clara (indyjanaam, neriahjanaam, makenziejanaam, jadeclara7425, lydaclara7425; 68 pins) ·
+  blue (sageblue, anastasiablue, evieblue `391504`, aryablue; 50) ·
+  nora (evienora4143, theanora4143, kaylanicora; 27, surelydecoratedfundraiser.com) ·
+  bulbul (lillianabulbul, matidabulbul, michellebulbul19233; 72) · doll (50) ·
+  amirahnora + lakelynnluna (35, shared auctionr ids) ·
+  juliat (isabelajuliat58396n24, lyricjuliat58396n24; 70) · izabellajuna + wynterluna2526 (21).
+  10 operators share no signal with anyone (incl. ariellejuliat58396n24, which only shares the name
+  family with the juliat pair, and all 3 netlify operators).
+- **The janaam + clara merge is only through one shared image signature**
+  (`3e2e4646ec80feae7e753ba034a6f2d6`, jadeclara7425 + makenziejanaam), not a key, auctionr id or
+  tinyurl. It may be the same operator or just the same stolen photo reused. **Key-based finding
+  still holds: no key / auctionr overlap between clusters.** Treat image-only links as weak.
+- Same domains across clusters: bulbul, juliat and blue all use depthschokedirected.com +
+  auctionr.org (separate keys); nora, clara, izabellajuna/wynterluna use surelydecoratedfundraiser.com.
+  Shared domain ≠ shared operator (the ad network owns the domain), but it fits one publisher
+  running several farms.
+- The juliat accounts are the oldest farm operators seen (created 2026-07-12…20; first bait
+  2026-08-20), kaylanicora created 2026-07-11 (warm-up max 124.8 days).
+- **Synchronised waves (one scheduler)** - new: aryablue + sageblue391504 at 09-30 07:26 and again
+  10-06 18:08 (confirms aryablue in the blue farm); bulbul trio at 10-15 05:40 (matida + michelle)
+  and all three at 10-21 17:19-17:20. Still: jadeclara + lydaclara 11-01 03:57; berkley66600 +
+  neriahjanaam 11-13 14:31 (different link schemes - probably coincidence).
+- **Netlify operators all run the same automated schedule**: abilenehahn6391o (125 pins, one
+  netlify host) and birgitoertel4823 (101 pins, another host) each start with a big burst
+  (50 in 7 min on 11-14; 49 in 34 min on 11-16), then waves of 2-5 pins every ~4-8 h starting at
+  :00-:03 or :30-:34 - same pattern as lisandra_mitchell6085 → probably one netlify operator with
+  one host per account, despite no shared signal.
+
 ## Open tasks / ideas
 
 1. [x] Attribute pins by `native_creator` (fallback pinner); separate "savers" (is_repin=1) from
@@ -123,7 +162,10 @@ Corrections to the list above: accounts do NOT post one bait pin, and keys are N
 7. Discovery beyond search: crawl the farm boards' followers / repinners of high-repin bait pins.
 8. Convert the remaining emoji queries in queries.txt to their plain-text cores (most return
    results, so `--prune` keeps them, but they add almost no new pins).
-9. Next network run: `profiles` + `expand` to crawl the 13 operators found via saved copies.
+9. [x] Next network run: `profiles` + `expand` to crawl the 13 operators found via saved copies.
+   *Done 2026-11-25: expand of all 18 uncrawled operators, then fetch + resolve (821 pins).*
+10. `clusters()`: image signatures alone merged janaam + clara. Consider making image a weak
+   signal (list image-only links separately instead of merging components).
 
 ## Project files
 
