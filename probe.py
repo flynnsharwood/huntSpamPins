@@ -114,7 +114,7 @@ def db_open(path):
     return con
 
 
-def targets(con, per_key=1, domain=None, only_key=None, kinds=None, proxy_label=None):
+def targets(con, per_key=1, domain=None, only_key=None, kinds=None, proxy_label=None, recheck=False):
     """One destination per key (smartlinks) / per URL path (auctionr, netlify, others), skipping
     groups already probed per_key times successfully through the same proxy (so switching proxy /
     country probes them again; errors, blank and proxy-blocked pages don't count). Newest first."""
@@ -127,6 +127,9 @@ def targets(con, per_key=1, domain=None, only_key=None, kinds=None, proxy_label=
         "SELECT group_id FROM probes WHERE (error IS NULL OR error = '') AND category NOT LIKE 'blocked%' "
         "AND category NOT LIKE 'blank%' AND category != 'error' AND (? IS NULL OR proxy = ?)",
         (proxy_label, proxy_label)))
+    ok_any = set() if not recheck else {r[0] for r in con.execute(
+        "SELECT group_id FROM probes WHERE (error IS NULL OR error = '') AND category NOT LIKE 'blocked%' "
+        "AND category NOT LIKE 'blank%' AND category != 'error'")}
     seen, out = set(), []
     for r in rows:
         kind = r["kind"] or ""
@@ -139,7 +142,7 @@ def targets(con, per_key=1, domain=None, only_key=None, kinds=None, proxy_label=
         h = host(r["final_url"])
         # one target per smartlink key, per netlify tracker host, per other URL path
         gid = r["key"] or (h if h.endswith("netlify.app") else f"{h}{urllib.parse.urlparse(r['final_url']).path}")
-        if gid in seen or done[gid] >= per_key:
+        if gid in seen or (gid not in ok_any if recheck else done[gid] >= per_key):
             continue
         seen.add(gid)
         out.append({"target": r["final_url"], "link": r["link"], "key": r["key"] or "",
@@ -464,6 +467,8 @@ def main():
     ap.add_argument("--key", help="only this smartlink key")
     ap.add_argument("--kind", action="append", help="only link kinds starting with this (repeatable)")
     ap.add_argument("--url", action="append", help="probe this URL instead of DB targets (repeatable)")
+    ap.add_argument("--recheck", action="store_true",
+                    help="visit again only targets that already have a successful probe (ignores --per-key)")
     ap.add_argument("--list", action="store_true", help="show stored probe results and exit")
     args = ap.parse_args()
 
@@ -492,7 +497,7 @@ def main():
     if args.url:
         tasks = [{"target": u, "link": None, "key": "", "group_id": u, "kind": "manual"} for u in args.url]
     else:
-        tasks = targets(con, args.per_key, args.domain, args.key, args.kind, label)
+        tasks = targets(con, args.per_key, args.domain, args.key, args.kind, label, args.recheck)
         if args.start == "link":
             for t in tasks:
                 t["destination"], t["target"] = t["target"], t["link"] or t["target"]

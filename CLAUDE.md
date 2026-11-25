@@ -213,6 +213,30 @@ Corrections to the list above: accounts do NOT post one bait pin, and keys are N
   - Confirms the "how they earn" section: traffic is sold via smartlinks / direct links whose
     ad networks route Indian mobile visitors to app-install (CPI) and sweepstakes offers.
     WARP IPs are not on these networks' proxy blocklists (free proxies are).
+- **Fourth probe (8 new targets) + recheck (5 earlier targets), WARP exit IN, 2026-11-25
+  15:52-16:05 UTC - all 13 reached an offer, none blocked.** Successful WARP probes now: 21
+  (`probe.py --list`; new `--recheck` visits only targets that already have a successful probe).
+  - **Every smartlink key → the same offer**: 5 keys on 5 different domains and operators
+    (249c6b2a walkingdrunkard / janaam, e3169a09 depthschokedirected / bulbul, e86fff9a
+    industriousslowly / mariamano948, 2f77569c revolthem and 5140d2c8 motortape via savers'
+    cutt.ly links) all end at `proprize.club/pop-verify?country=IN&mc_attr=c=d0d6159f-198c-4c7d-
+    bcd9-434e2a19874d..m=<per-click id>` - **one advertiser campaign id for all of them**. → the
+    rotating 3-word `?key=` domains are one smartlink network (same ad server picks the offer);
+    this says nothing about the operators being one person.
+  - **Netlify and auctionr end at the same tracker**: all 3 netlify hosts (piroshki, tartufo,
+    licorice) and auctionr ids `1fb75ff8…` and `fbd5812e…` (both neriahjanaam) →
+    `meetsweetmeet.online/l4-banners[-1]/` / `l4-v2-banners-1/` / `l4-v2-soft-1/` with
+    `p1=https://hiiltrack.online/click.php?lp=1` and `clickid=10_dc3g…350qs73b…` (Keitaro-style
+    tracker; same clickid stem everywhere). auctionr `e607f497…` (juliat pair) is the exception:
+    3 of 3 visits → Neuro app pre-lander (toolaris-app.com, same Play Store affiliate link).
+  - **podnova → blogspot** (berkley66600): `yuiuuyttyikkoi.blogspot.com` post →
+    `cdn.bollywoodmenswear.com/tml/<template>.html` "Lucky Gift" prize pages; the template
+    rotates per visit (`turntablePopNestingPush`, `simpleScratch2`, `LickNative_positon`).
+  - **Stability on recheck**: smartlink keys and the auctionr Neuro id gave the same offer each
+    time (only the per-click id changes); the netlify page rotated landing variants
+    (banners-1 → v2-soft-1 → banners-1); podnova rotated templates. Offers in IN are few:
+    proprize (smartlinks), meetsweetmeet/FlickBrowser (netlify + most auctionr), Neuro app,
+    bollywoodmenswear prize pages (podnova).
 
 ## Open tasks / ideas
 
