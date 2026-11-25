@@ -25,7 +25,7 @@ Individual steps
     status     quick counts
 """
 import argparse, collections, csv, datetime as dt, hashlib, importlib.util, json, os, re, shutil
-import random, sqlite3, subprocess, sys, time
+import random, sqlite3, subprocess, sys, time, unicodedata
 import urllib.error, urllib.parse, urllib.request
 from email.utils import parsedate_to_datetime
 
@@ -864,15 +864,46 @@ def step_archive(db, root="archive", force=False, html=True, media=True, account
                                      p.archived_at, l.final_domain, l.key FROM pins p
                                      LEFT JOIN links l ON l.link=p.link
                                      WHERE p.archived_at IS NOT NULL ORDER BY p.created_at""")]
-    I = ["# Archive index", "", f"Updated {now()} — {len(rows)} pins", "",
-         "| created | pin | poster | destination | key | still live? | folder |", "|---|---|---|---|---|---|---|"]
+    I = ["# Archive index", "", f"Updated {now()} — {len(rows)} pins", ""]
+    T = []
     for r in rows:
         rel = os.path.relpath(r["archive_dir"], root) if r["archive_dir"] else ""
-        I.append(f"| {(r['created_at'] or '')[:10]} | {r['pin_id']} | {r['pinner']} | {r['final_domain'] or ''} | "
-                 f"{(r['key'] or '')[:10]} | {'no' if r['status'] == 'removed' else 'yes'} | [{rel}]({rel}/summary.md) |")
+        T.append([(r['created_at'] or '')[:10], r['pin_id'], r['pinner'], r['final_domain'] or '',
+                  (r['key'] or '')[:10], 'no' if r['status'] == 'removed' else 'yes', f"[{rel}]({rel}/summary.md)"])
+    I.append(md_table(["created", "pin", "poster", "destination", "key", "still live?", "folder"], T))
     with open(os.path.join(root, "index.md"), "w", encoding="utf-8") as f:
         f.write("\n".join(I) + "\n")
     log(f"[archive] index: {os.path.join(root, 'index.md')}")
+
+
+# ----------------------------------------------------------------- markdown tables
+def _width(s):
+    """Approximate terminal/monospace display width (emoji and CJK = 2, combining marks/VS16/ZWJ = 0)."""
+    w = 0
+    for i, ch in enumerate(s):
+        if unicodedata.combining(ch) or ch in "\u200d\ufe0e\ufe0f" or unicodedata.category(ch) == "Cf":
+            continue
+        emoji = s[i + 1:i + 2] == "\ufe0f"   # e.g. "▶️": a narrow symbol drawn as a wide emoji
+        w += 2 if emoji or unicodedata.east_asian_width(ch) in "WF" else 1
+    return w
+
+
+def md_table(headers, rows, align=""):
+    """Markdown table with columns padded to equal width. align: one char per column, 'l' or 'r'."""
+    cells = [[str(h) for h in headers]] + [
+        ["" if c is None else str(c).replace("|", "\\|").replace("\n", " ") for c in row] for row in rows]
+    n = len(headers)
+    align = (align + "l" * n)[:n]
+    widths = [max(3, *(_width(r[i]) for r in cells)) for i in range(n)]
+
+    def line(r):
+        out = []
+        for i, c in enumerate(r):
+            pad = " " * (widths[i] - _width(c))
+            out.append(pad + c if align[i] == "r" else c + pad)
+        return "| " + " | ".join(out) + " |"
+    sep = "| " + " | ".join("-" * (w - 1) + ":" if a == "r" else "-" * w for w, a in zip(widths, align)) + " |"
+    return "\n".join([line(cells[0]), sep] + [line(r) for r in cells[1:]])
 
 
 # ----------------------------------------------------------------- report
@@ -922,19 +953,20 @@ def report(db, out_md="report.md", out_csv="pins.csv", since=None):
     if since:
         P(f"- New pins found this run: **{sum(1 for r in rows if (r['first_seen'] or '') >= since)}**")
 
-    P("\n## Link chain types\n\n| count | chain |\n|---:|---|")
-    for k, n in collections.Counter(r["kind"] or "(unresolved)" for r in linked).most_common():
-        P(f"| {n} | {k} |")
+    P("\n## Link chain types\n")
+    P(md_table(["count", "chain"], [[n, k] for k, n in collections.Counter(
+        r["kind"] or "(unresolved)" for r in linked).most_common()], "rl"))
 
-    P("\n## Final domains\n\n| domain | pins | keys | posters | first pin | last pin |\n|---|---:|---:|---:|---|---|")
+    P("\n## Final domains\n")
+    T = []
     by_dom = collections.defaultdict(list)
     for r in linked:
         by_dom[r["final_domain"] or "(unresolved)"].append(r)
     for dom, rs in sorted(by_dom.items(), key=lambda kv: -len(kv[1])):
         dates = sorted(r["created_at"] for r in rs if r["created_at"])
-        P(f"| {dom} | {len(rs)} | {len({r['key'] for r in rs if r['key']})} | "
-          f"{len({r['pinner'] for r in rs})} | {dates[0][:10] if dates else ''} | "
-          f"{dates[-1][:10] if dates else ''} |")
+        T.append([dom, len(rs), len({r['key'] for r in rs if r['key']}), len({r['pinner'] for r in rs}),
+                  dates[0][:10] if dates else '', dates[-1][:10] if dates else ''])
+    P(md_table(["domain", "pins", "keys", "posters", "first pin", "last pin"], T, "lrrrll"))
 
     P("\n## Domain timeline (bait pins per ISO week)\n")
     weeks = collections.defaultdict(collections.Counter)
@@ -945,9 +977,9 @@ def report(db, out_md="report.md", out_csv="pins.csv", since=None):
     for wk in sorted(weeks):
         P(f"- {wk}: " + ", ".join(f"{d} ×{n}" for d, n in weeks[wk].most_common()))
 
-    P("\n## Title variants\n\n| count | title |\n|---:|---|")
-    for k, n in collections.Counter(r["title"] for r in bait).most_common(25):
-        P(f"| {n} | `{k}` |")
+    P("\n## Title variants\n")
+    P(md_table(["count", "title"], [[n, f"`{k}`"] for k, n in
+                                     collections.Counter(r["title"] for r in bait).most_common(25)], "rl"))
 
     P("\n## Account batches (usernames sharing a numeric suffix)\n")
     bt = batches({r["pinner"] for r in bait if r["pinner"]})
@@ -968,23 +1000,24 @@ def report(db, out_md="report.md", out_csv="pins.csv", since=None):
     else:
         P("- no data yet")
 
-    P("\n## Poster accounts\n\n| account | created | pins | boards | followers | status | bait pins | domains |"
-      "\n|---|---|---:|---:|---:|---|---:|---|")
+    P("\n## Poster accounts\n")
+    T = []
     acc = collections.defaultdict(list)
     for r in bait:
         acc[r["pinner"]].append(r)
     for u, rs in sorted(acc.items(), key=lambda kv: kv[1][0]["acct_created"] or ""):
         r0 = rs[0]
-        P(f"| {u} | {(r0['acct_created'] or '')[:10]} | {r0['acct_pins']} | {r0['acct_boards']} | "
-          f"{r0['acct_followers']} | {r0['acct_status']} | {len(rs)} | "
-          f"{', '.join(sorted({r['final_domain'] for r in rs if r['final_domain']}))} |")
+        T.append([u, (r0['acct_created'] or '')[:10], r0['acct_pins'], r0['acct_boards'], r0['acct_followers'],
+                  r0['acct_status'], len(rs), ', '.join(sorted({r['final_domain'] for r in rs if r['final_domain']}))])
+    P(md_table(["account", "created", "pins", "boards", "followers", "status", "bait pins", "domains"], T,
+               "llrrrlrl"))
 
-    P("\n## Bait pins with links (newest first)\n\n| created | pin | poster | warm-up | repins | destination | key |"
-      "\n|---|---|---|---:|---:|---|---|")
-    for r in sorted(linked, key=lambda r: r["created_at"] or "", reverse=True)[:300]:
-        P(f"| {(r['created_at'] or '')[:16]} | [{r['pin_id']}](https://www.pinterest.com/pin/{r['pin_id']}/) | "
-          f"{r['pinner']} | {r['warmup_days'] if r['warmup_days'] is not None else ''} | {r['repin_count']} | "
-          f"{r['final_domain'] or ''}{(r['path'] or '')[:25]} | {(r['key'] or '')[:10]} |")
+    P("\n## Bait pins with links (newest first)\n")
+    P(md_table(["created", "pin", "poster", "warm-up", "repins", "destination", "key"],
+               [[(r['created_at'] or '')[:16], f"[{r['pin_id']}](https://www.pinterest.com/pin/{r['pin_id']}/)",
+                 r['pinner'], r['warmup_days'], r['repin_count'],
+                 f"{r['final_domain'] or ''}{(r['path'] or '')[:25]}", (r['key'] or '')[:10]]
+                for r in sorted(linked, key=lambda r: r["created_at"] or "", reverse=True)[:300]], "lllrrll"))
 
     nolink = [r for r in bait if not r["link"]]
     if nolink:
@@ -998,10 +1031,10 @@ def report(db, out_md="report.md", out_csv="pins.csv", since=None):
                  ORDER BY new_pins DESC""")
     if qs:
         P("\n## Search query performance\n\nQueries with 0 new pins over several runs are candidates "
-          "for deleting from the queries file.\n\n| query | runs | results seen | new pins added | last run |"
-          "\n|---|---:|---:|---:|---|")
-        for q in qs:
-            P(f"| `{q['query']}` | {q['runs']} | {q['results']} | {q['new_pins']} | {(q['last'] or '')[:16]} |")
+          "for deleting from the queries file.\n")
+        P(md_table(["query", "runs", "results seen", "new pins added", "last run"],
+                   [[f"`{q['query']}`", q['runs'], q['results'], q['new_pins'], (q['last'] or '')[:16]] for q in qs],
+                   "lrrrl"))
 
     removed = [r for r in rows if r["status"] == "removed"]
     if removed:
@@ -1037,10 +1070,10 @@ def main():
     qp.add_argument("--dry-run", action="store_true", help="with --update: only show what would be added")
     qp.add_argument("--min-count", type=int, default=1, help="only phrases seen on at least N bait pins")
     s.add_argument("--max-pages", type=int, default=6)
-    s.add_argument("--sample", type=int, default=7, help="random items per list each step: search queries, and each expand list (0 = all; default 7)")
+    s.add_argument("--sample", type=int, default=5, help="random items per list each step: search queries, and each expand list (0 = all; default 7)")
     e = sp.add_parser("expand"); e.add_argument("--max-related", type=int, default=40)
     e.add_argument("--max-pages", type=int, default=6)
-    e.add_argument("--sample", type=int, default=7, help="random items per list each step: search queries, and each expand list (0 = all; default 7)")
+    e.add_argument("--sample", type=int, default=5, help="random items per list each step: search queries, and each expand list (0 = all; default 7)")
     rc = sp.add_parser("recheck"); rc.add_argument("--days", type=float, default=3)
     ar = sp.add_parser("archive", help="save evidence folders for bait pins")
     ar.add_argument("--dir", default="archive")
@@ -1059,7 +1092,7 @@ def main():
     ru.add_argument("--rounds", type=int, default=2, help="expand rounds")
     ru.add_argument("--max-pages", type=int, default=6)
     ru.add_argument("--max-related", type=int, default=40)
-    ru.add_argument("--sample", type=int, default=7, help="random items per list each step: search queries, and each expand list (0 = all; default 7)")
+    ru.add_argument("--sample", type=int, default=5, help="random items per list each step: search queries, and each expand list (0 = all; default 7)")
     ru.add_argument("--query", action="append", default=[])
     ru.add_argument("--queries", default="queries.txt", help="queries file (default: queries.txt)")
     ru.add_argument("--no-update-queries", action="store_true",
